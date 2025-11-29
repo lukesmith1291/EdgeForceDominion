@@ -1,204 +1,308 @@
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
+
+import pandas as pd
+import requests
 import streamlit as st
 
-# ==============================
-# CONFIG
-# ==============================
+# ============================================================
+#  GLOBAL CONFIG
+# ============================================================
 st.set_page_config(
-    page_title="Edge Force Dominion – EFD Scoring Engine",
-    layout="wide"
+    page_title="Edge Force Dominion – Live Deck",
+    layout="wide",
 )
 
-EFD_WEIGHTS = {
-    "ev": 0.40,
-    "market_ineff": 0.25,
-    "sharp_steam": 0.15,
-    "line_velocity": 0.10,
-    "public_bias": 0.10,
+OPTICODDS_API_BASE = "https://api.opticodds.com/api/v3"
+
+SPORTS = {
+    "🏀 NBA": "nba",
+    "🏈 NFL": "nfl",
+    "🏒 NHL": "nhl",
+    "🏀 NCAAB": "ncaab",
+    "🏈 NCAAF": "ncaaf",
+    "⚽ Soccer": "soccer",
 }
 
+BOOKS_ALL = ["FanDuel", "DraftKings", "BetMGM", "Caesars", "Pinnacle", "LowVig"]
 
-def compute_efd(ev_pct,
-                market_ineff,
-                sharp_steam,
-                line_velocity,
-                public_bias,
-                committee_override):
-    """
-    EFD Score formula:
-
-    EFD =
-      (EV_Score * 0.40) +
-      (Market_Inefficiency * 0.25) +
-      (Sharp_Steam * 0.15) +
-      (Line_Move_Velocity * 0.10) +
-      (Public_Sentiment_Bias * 0.10) +
-      (Committee_Override)
-
-    Where:
-      - ev_pct is EV in percent (e.g. 6.4 for +6.4% EV)
-      - market_ineff, sharp_steam, line_velocity, public_bias are 0–100 scaled scores
-      - committee_override is 0–10
-    """
-
-    # Clamp EV to [0, 100] (negative EV treated as 0 edge)
-    ev_score = max(min(ev_pct, 100.0), 0.0)
-
-    mi_score = max(min(market_ineff, 100.0), 0.0)
-    ss_score = max(min(sharp_steam, 100.0), 0.0)
-    lv_score = max(min(line_velocity, 100.0), 0.0)
-    pb_score = max(min(public_bias, 100.0), 0.0)
-    co_score = max(min(committee_override, 10.0), 0.0)
-
-    efd = (
-        ev_score * EFD_WEIGHTS["ev"] +
-        mi_score * EFD_WEIGHTS["market_ineff"] +
-        ss_score * EFD_WEIGHTS["sharp_steam"] +
-        lv_score * EFD_WEIGHTS["line_velocity"] +
-        pb_score * EFD_WEIGHTS["public_bias"] +
-        co_score
-    )
-
-    # Clamp final score to [0, 100] for consistency
-    efd = max(min(efd, 100.0), 0.0)
-    return round(efd, 1)
-
-
-def tier_from_efd(efd_score: float) -> str:
-    if efd_score >= 70:
-        return "Tier A – Glitch / Must-Bet"
-    elif efd_score >= 55:
-        return "Tier B – High-Value"
-    elif efd_score >= 40:
-        return "Tier C – Situational"
-    else:
-        return "Do Not Bet"
-
-
-# ==============================
-# UI LAYOUT
-# ==============================
-st.title("🏆 Edge Force Dominion")
-st.subheader("EFD Scoring Engine (Prototype Streamlit UI)")
-
+# ============================================================
+#  STYLE – SPORTY / FUTURISTIC
+# ============================================================
 st.markdown(
     """
-This tool lets you plug in the components of an Edge Force Dominion edge and see the resulting **EFD score (0–100)** and Tier.
+<style>
+/* Global dark theme tweaks */
+body {
+    background-color: #05060a;
+}
 
-Use this as a:
-- **manual grading UI** now
-- and later swap the inputs with live data from **BigQuery / Odds APIs / Google Trends**.
-"""
+section.main {
+    background: radial-gradient(circle at top, #141b33 0, #05060a 45%);
+    color: #f5f7ff;
+}
+
+/* Headers */
+h1, h2, h3 {
+    font-family: -apple-system, system-ui, BlinkMacSystemFont, "SF Pro Display";
+    letter-spacing: 0.03em;
+}
+
+/* Cards */
+.efd-card {
+    border-radius: 16px;
+    padding: 1rem 1.25rem;
+    border: 1px solid rgba(120, 180, 255, 0.45);
+    background: linear-gradient(135deg, rgba(17, 24, 48, 0.98), rgba(8, 11, 22, 0.98));
+    box-shadow: 0 0 25px rgba(0, 180, 255, 0.18);
+}
+
+/* Tables */
+.dataframe tbody tr:hover {
+    background-color: rgba(41, 98, 255, 0.18) !important;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: radial-gradient(circle at top left, #111628 0, #05060a 55%);
+    border-right: 1px solid rgba(100, 150, 255, 0.3);
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# --- LEFT: Inputs ---
-left_col, right_col = st.columns([1, 1])
+# ============================================================
+#  HELPERS
+# ============================================================
 
-with left_col:
-    st.header("📥 Market Inputs")
 
-    st.markdown("### Core Value")
-    ev_pct = st.number_input(
-        "Expected Value (EV %) – e.g. 6.4 for +6.4% EV",
-        min_value=-50.0,
-        max_value=50.0,
-        value=5.0,
-        step=0.1,
-        help="If EV is negative, the score will clip it at 0."
+def american_to_decimal(odds: float) -> float:
+    """Convert American odds to decimal."""
+    try:
+        odds = float(odds)
+    except Exception:
+        return 1.0
+    if odds > 0:
+        return odds / 100.0 + 1.0
+    else:
+        return 100.0 / abs(odds) + 1.0
+
+
+def build_demo_snapshot(sport_code: str) -> pd.DataFrame:
+    """Fallback demo data so the UI always renders."""
+    now = datetime.utcnow()
+    rows = []
+
+    # Single demo game per sport
+    rows.append(
+        dict(
+            fixture_id=f"{sport_code.upper()}-EX1",
+            league=sport_code.upper(),
+            start_time=now + timedelta(hours=2),
+            home_team="Edge City Titans",
+            away_team="Quantum Sharks",
+            market_key="moneyline",
+            market_name="Moneyline",
+            outcome_key="home",
+            outcome_name="Edge City Titans",
+            bookmaker="FanDuel",
+            open_odds=-140,
+            current_odds=-165,
+            last_updated=now,
+        )
+    )
+    rows.append(
+        dict(
+            fixture_id=f"{sport_code.upper()}-EX1",
+            league=sport_code.upper(),
+            start_time=now + timedelta(hours=2),
+            home_team="Edge City Titans",
+            away_team="Quantum Sharks",
+            market_key="moneyline",
+            market_name="Moneyline",
+            outcome_key="away",
+            outcome_name="Quantum Sharks",
+            bookmaker="DraftKings",
+            open_odds=120,
+            current_odds=140,
+            last_updated=now,
+        )
     )
 
-    market_ineff = st.number_input(
-        "Market Inefficiency Score (0–100)",
-        min_value=0.0,
-        max_value=100.0,
-        value=15.0,
-        step=0.5,
-        help="How mispriced is this line vs consensus? 0 = none, 100 = huge."
-    )
+    return pd.DataFrame(rows)
 
-    st.markdown("### Movement & Sharps")
-    sharp_steam = st.slider(
-        "Sharp Steam Score (0–100)",
-        min_value=0,
-        max_value=100,
-        value=30,
-        help="Captures sharp-driven line movement (across key numbers, etc.)."
-    )
 
-    line_velocity = st.slider(
-        "Line Move Velocity (0–100)",
-        min_value=0,
-        max_value=100,
-        value=20,
-        help="How quickly the line has moved in a short window."
-    )
+def normalize_opticodds_json(raw: Dict[str, Any], sport_code: str) -> pd.DataFrame:
+    """
+    🔧 THIS IS THE ONLY PART YOU'LL LIKELY NEED TO TWEAK ONCE
+    YOU SEE REAL OPTICODDS JSON.
 
-    st.markdown("### Public & Narrative")
-    public_bias = st.slider(
-        "Public Sentiment Bias (0–100)",
-        min_value=0,
-        max_value=100,
-        value=10,
-        help="Public hype / Google Trends imbalance / book splits."
-    )
+    Right now this is a generic normalizer that expects something like:
 
-    committee_override = st.slider(
-        "Committee Override Bonus (+0 to +10)",
-        min_value=0,
-        max_value=10,
-        value=0,
-        help="Manual boost for motivation, injuries, revenge, etc."
-    )
-
-with right_col:
-    st.header("📊 EFD Score")
-
-    efd_score = compute_efd(
-        ev_pct=ev_pct,
-        market_ineff=market_ineff,
-        sharp_steam=sharp_steam,
-        line_velocity=line_velocity,
-        public_bias=public_bias,
-        committee_override=committee_override,
-    )
-
-    tier_label = tier_from_efd(efd_score)
-
-    # Big score display
-    st.markdown(
-        f"""
-        <div style="padding: 1.5rem; border-radius: 0.75rem; border: 1px solid #444;">
-            <h2 style="margin-bottom: 0.5rem;">EFD Score</h2>
-            <h1 style="font-size: 3.5rem; margin: 0;">{efd_score}</h1>
-            <p style="font-size: 1.25rem; margin-top: 0.5rem;"><b>{tier_label}</b></p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown("### Component Breakdown")
-    st.write(
+    {
+      "fixtures": [
         {
-            "EV Weight (40%)": ev_pct,
-            "Market Inefficiency (25%)": market_ineff,
-            "Sharp Steam (15%)": sharp_steam,
-            "Line Velocity (10%)": line_velocity,
-            "Public Bias (10%)": public_bias,
-            "Committee Override (+0–10)": committee_override,
+          "id": "...",
+          "league": "...",
+          "home_team": "...",
+          "away_team": "...",
+          "start_time": "...",
+          "markets": [
+            {
+              "key": "moneyline",
+              "name": "Moneyline",
+              "outcomes": [
+                {
+                  "key": "home",
+                  "name": "...",
+                  "bookmaker": "FanDuel",
+                  "open_odds": -140,
+                  "current_odds": -165,
+                  "last_updated": "..."
+                },
+                ...
+              ]
+            }
+          ]
         }
-    )
+      ]
+    }
 
-    st.markdown("### Tier Rules")
-    st.markdown(
-        """
-- **Tier A**: EFD ≥ 70 — *Glitch / Must-Bet*  
-- **Tier B**: 55–69 — *High-Value*  
-- **Tier C**: 40–54 — *Situational*  
-- **Do Not Bet**: EFD < 40
-"""
-    )
+    If your JSON shape is different, just adjust the traversal and keep
+    the output columns the same.
+    """
+    fixtures = raw.get("fixtures") or raw.get("data") or []
+    rows = []
 
-st.markdown("---")
-st.caption(
-    "Prototype only. Next step: wire these inputs to live data from Odds APIs, "
-    "BigQuery (historical & consensus lines), and Google Trends for public bias."
-)
+    for f in fixtures:
+        fixture_id = f.get("id") or f.get("fixture_id")
+        league = f.get("league", {}).get("name") if isinstance(f.get("league"), dict) else f.get("league", sport_code.upper())
+        start_time = f.get("start_time") or f.get("commence_time")
+        home_team = f.get("home_team") or f.get("home")
+        away_team = f.get("away_team") or f.get("away")
+
+        markets = f.get("markets", []) or f.get("odds", [])
+        for m in markets:
+            m_key = m.get("key") or m.get("market_key") or "moneyline"
+            m_name = m.get("name") or m_key.title()
+            outcomes = m.get("outcomes") or m.get("lines") or []
+            for o in outcomes:
+                rows.append(
+                    dict(
+                        fixture_id=fixture_id,
+                        league=league,
+                        start_time=start_time,
+                        home_team=home_team,
+                        away_team=away_team,
+                        market_key=m_key,
+                        market_name=m_name,
+                        outcome_key=o.get("key") or o.get("outcome_key"),
+                        outcome_name=o.get("name") or o.get("outcome_name"),
+                        bookmaker=o.get("bookmaker") or o.get("book") or "Unknown",
+                        open_odds=o.get("open_odds") or o.get("opening_line") or o.get("odds"),
+                        current_odds=o.get("current_odds") or o.get("line") or o.get("odds"),
+                        last_updated=o.get("last_updated") or f.get("last_update"),
+                    )
+                )
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+
+    # Basic cleanup
+    df["start_time"] = pd.to_datetime(df["start_time"], errors="coerce", utc=True)
+    df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce", utc=True)
+    df["current_odds"] = pd.to_numeric(df["current_odds"], errors="coerce")
+    df["open_odds"] = pd.to_numeric(df["open_odds"], errors="coerce")
+
+    return df
+
+
+def fetch_opticodds_snapshot(
+    api_key: str,
+    sport_code: str,
+    sportsbooks: List[str],
+    min_odds: int,
+    max_odds: int,
+    markets: List[str],
+) -> pd.DataFrame:
+    """
+    Core fetcher. Ready for OpticOdds.
+
+    - If api_key is empty OR request fails -> returns demo data.
+    - Once you see real JSON in logs, tweak normalize_opticodds_json().
+    """
+    if not api_key:
+        return build_demo_snapshot(sport_code)
+
+    try:
+        url = f"{OPTICODDS_API_BASE}/fixtures/odds/{sport_code}"
+        params = {
+            "sportsbooks": ",".join(sportsbooks) if sportsbooks else None,
+            "markets": ",".join(markets) if markets else None,
+            "event_status": "upcoming",
+        }
+        headers = {"x-api-key": api_key}
+
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+
+        df = normalize_opticodds_json(raw, sport_code)
+        if df.empty:
+            st.warning("OpticOdds returned no rows – falling back to demo data.")
+            return build_demo_snapshot(sport_code)
+
+        # Odds filter
+        df = df[(df["current_odds"] >= min_odds) & (df["current_odds"] <= max_odds)]
+        if df.empty:
+            return df
+
+        return df
+
+    except Exception as e:
+        st.warning(f"OpticOdds error: {e}. Showing demo data instead.")
+        return build_demo_snapshot(sport_code)
+
+
+def compute_line_movement(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["line_move"] = df["current_odds"] - df["open_odds"]
+    df["move_abs"] = df["line_move"].abs()
+    return df
+
+
+def detect_steam(df: pd.DataFrame, min_move: int = 20) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = compute_line_movement(df)
+    steam = df[df["move_abs"] >= min_move]
+    return steam.sort_values("move_abs", ascending=False)
+
+
+def detect_two_way_arbitrage(df: pd.DataFrame, min_edge_pct: float = 0.5) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    records = []
+    for (fixture_id, market_key), group in df.groupby(["fixture_id", "market_key"]):
+        best_by_outcome = (
+            group.sort_values("current_odds", ascending=False)
+            .groupby("outcome_key")
+            .head(1)
+        )
+
+        if best_by_outcome["outcome_key"].nunique() != 2:
+            continue
+
+        sides = list(best_by_outcome.to_dict("records"))
+        d1 = american_to_decimal(sides[0]["current_odds"])
+        d2 = american_to_decimal(sides[1]["current_odds"])
+        inv_sum = 1.0 / d1 + 1.0 / d2
+
+        if inv_sum < 1.0:
+            edge = (1.0 -
