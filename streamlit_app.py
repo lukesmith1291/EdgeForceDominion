@@ -1,5 +1,7 @@
 import os
-from datetime import datetime, timedelta
+import json
+import time
+from datetime import datetime
 from typing import List, Dict, Any, Tuple
 
 import pandas as pd
@@ -7,53 +9,50 @@ import requests
 import streamlit as st
 
 # ============================================================
-#  GLOBAL CONFIG
+#  CONFIG
 # ============================================================
-st.set_page_config(
-    page_title="Edge Force Dominion – Live Deck",
-    layout="wide",
-)
+st.set_page_config(page_title="Edge Force Dominion – Live Stream", layout="wide")
 
 OPTICODDS_API_BASE = "https://api.opticodds.com/api/v3"
 
-SPORTS = {
-    "🏀 NBA": "nba",
-    "🏈 NFL": "nfl",
-    "🏒 NHL": "nhl",
-    "🏀 NCAAB": "ncaab",
-    "🏈 NCAAF": "ncaaf",
-    "⚽ Soccer": "soccer",
+SPORT_MAP = {
+    "🏀 NBA": {"sport": "basketball", "leagues": ["NBA"]},
+    "🏀 NCAAB": {"sport": "basketball", "leagues": ["NCAAB"]},
+    "🏈 NFL": {"sport": "football", "leagues": ["NFL"]},
+    "🏈 NCAAF": {"sport": "football", "leagues": ["NCAAF"]},
+    "🏒 NHL": {"sport": "hockey", "leagues": ["NHL"]},
+    "⚽ Soccer": {"sport": "soccer", "leagues": []},
 }
 
 BOOKS_ALL = ["FanDuel", "DraftKings", "BetMGM", "Caesars", "Pinnacle", "LowVig"]
 
 # ============================================================
-#  STYLE – FUTURISTIC UI
+#  STYLE
 # ============================================================
 st.markdown(
     """
 <style>
 section.main {
-    background: radial-gradient(circle at top, #131a2f 0%, #05060a 60%);
-    color: #f5f7ff;
+    background: radial-gradient(circle at top, #111827 0%, #020617 55%);
+    color: #f9fafb;
     font-family: -apple-system, system-ui, BlinkMacSystemFont, "SF Pro Display";
 }
 
 .efd-card {
-    border-radius: 16px;
-    padding: 1.25rem;
-    border: 1px solid rgba(120, 180, 255, 0.45);
-    background: rgba(10, 14, 30, 0.92);
-    box-shadow: 0 0 24px rgba(0,150,255,0.30);
+    border-radius: 18px;
+    padding: 1.25rem 1.5rem;
+    border: 1px solid rgba(96, 165, 250, 0.65);
+    background: rgba(15, 23, 42, 0.94);
+    box-shadow: 0 0 32px rgba(37, 99, 235, 0.55);
 }
 
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0b0f1a, #05060a);
-    border-right: 1px solid rgba(100,150,255,0.3);
+    background: linear-gradient(180deg, #020617, #020617);
+    border-right: 1px solid rgba(55, 65, 81, 0.8);
 }
 
 .dataframe tbody tr:hover {
-    background-color: rgba(41, 98, 255, 0.22) !important;
+    background-color: rgba(59, 130, 246, 0.22) !important;
 }
 </style>
 """,
@@ -61,394 +60,329 @@ section.main {
 )
 
 # ============================================================
-#  HELPERS
+#  UTILS
 # ============================================================
 
 def american_to_decimal(odds: float) -> float:
-    """Convert American odds to decimal."""
     try:
-        odds = float(odds)
+        o = float(odds)
     except Exception:
         return 1.0
-    return (odds / 100.0 + 1.0) if odds > 0 else (100.0 / abs(odds) + 1.0)
+    return (o / 100.0 + 1.0) if o > 0 else (100.0 / abs(o) + 1.0)
 
 
-def normalize_opticodds_json(raw: Dict[str, Any], sport_code: str) -> pd.DataFrame:
+def parse_sse_stream(
+    resp: requests.Response,
+    max_events: int = 200,
+    max_seconds: int = 8,
+) -> List[Tuple[str, str]]:
     """
-    Normalize OpticOdds JSON into a tabular frame.
-    You may need to tweak this once you see real JSON.
+    Minimal SSE parser (no extra deps).
+    Returns list of (event_name, data_json).
     """
-    fixtures = raw.get("fixtures") or raw.get("data") or []
+    events: List[Tuple[str, str]] = []
+    event_name = None
+    data_lines: List[str] = []
+    start = time.time()
+
+    for raw in resp.iter_lines(decode_unicode=True):
+        if time.time() - start > max_seconds:
+            break
+        if raw is None:
+            continue
+        line = raw.strip()
+        if not line:
+            # dispatch
+            if event_name and data_lines:
+                events.append((event_name, "\n".join(data_lines)))
+                if len(events) >= max_events:
+                    break
+            event_name = None
+            data_lines = []
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+
+    return events
+
+
+def stream_odds_once(
+    api_key: str,
+    sport: str,
+    leagues: List[str],
+    sportsbooks: List[str],
+    markets: List[str],
+    max_events: int = 150,
+) -> pd.DataFrame:
+    """
+    Hit /stream/odds/{sport} once, collect a burst of odds + locked-odds events,
+    and return a DataFrame with open/current price + line movement per selection.
+    """
+    if not api_key:
+        st.error("Paste your OpticOdds key in the sidebar and hit 'Test & Use Key'.")
+        return pd.DataFrame()
+
+    params: Dict[str, Any] = {
+        "key": api_key,
+        "sportsbook": sportsbooks or [],
+        "market": markets or ["Moneyline"],
+    }
+    if leagues:
+        params["league"] = leagues
+    url = f"{OPTICODDS_API_BASE}/stream/odds/{sport}"
+
+    try:
+        resp = requests.get(url, params=params, stream=True, timeout=12)
+        resp.raise_for_status()
+    except Exception as e:
+        st.error(f"Error opening stream: {e}")
+        return pd.DataFrame()
+
+    events = parse_sse_stream(resp, max_events=max_events)
+    resp.close()
+
     rows: List[Dict[str, Any]] = []
-
-    for f in fixtures:
-        fixture_id = f.get("id") or f.get("fixture_id")
-        league = f.get("league", sport_code.upper())
-        start_time = f.get("start_time") or f.get("commence_time")
-        home_team = f.get("home_team") or f.get("home")
-        away_team = f.get("away_team") or f.get("away")
-
-        markets = f.get("markets") or f.get("odds") or []
-        for m in markets:
-            m_key = m.get("key") or m.get("market_key") or "moneyline"
-            m_name = m.get("name") or "Moneyline"
-
-            outcomes = m.get("outcomes") or m.get("lines") or []
-            for o in outcomes:
-                open_val = (
-                    o.get("open_odds")
-                    or o.get("opening_line")
-                    or o.get("opening_odds")
-                    or o.get("open")
-                    or o.get("odds")
+    for ev_name, data_str in events:
+        if ev_name not in ("odds", "locked-odds"):
+            continue
+        try:
+            payload = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        entry_type = payload.get("type", ev_name)
+        for odd in payload.get("data", []):
+            rows.append(
+                dict(
+                    event_type=entry_type,
+                    fixture_id=odd.get("fixture_id"),
+                    game_id=odd.get("game_id"),
+                    sport=odd.get("sport"),
+                    league=odd.get("league"),
+                    market=odd.get("market"),
+                    selection=odd.get("name") or odd.get("selection"),
+                    sportsbook=odd.get("sportsbook"),
+                    price=odd.get("price"),
+                    timestamp=odd.get("timestamp"),
                 )
-                current_val = (
-                    o.get("current_odds")
-                    or o.get("current_line")
-                    or o.get("live_line")
-                    or o.get("line")
-                    or o.get("odds")
-                )
-                rows.append(
-                    dict(
-                        fixture_id=fixture_id,
-                        league=league,
-                        start_time=start_time,
-                        home_team=home_team,
-                        away_team=away_team,
-                        market_key=m_key,
-                        market_name=m_name,
-                        outcome_key=o.get("key") or o.get("outcome_key"),
-                        outcome_name=o.get("name") or o.get("outcome_name"),
-                        bookmaker=o.get("bookmaker") or o.get("book") or "Unknown",
-                        open_odds=open_val,
-                        current_odds=current_val,
-                        last_updated=o.get("last_updated") or f.get("last_update"),
-                    )
-                )
+            )
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df["current_odds"] = pd.to_numeric(df["current_odds"], errors="coerce")
-    df["open_odds"] = pd.to_numeric(df["open_odds"], errors="coerce")
-    df["start_time"] = pd.to_datetime(df["start_time"], errors="coerce", utc=True)
-    df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce", utc=True)
-    return df
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
 
+    # aggregate to open/current per selection within this burst
+    key_cols = ["fixture_id", "sportsbook", "market", "selection"]
+    df = df.dropna(subset=["price", "timestamp"])
+    df = df.sort_values("timestamp")
 
-def test_opticodds_connection(api_key: str) -> Tuple[bool, str, Dict[str, Any]]:
-    """Test NBA once and report status + raw JSON (for debugging)."""
-    if not api_key:
-        return False, "No API key provided.", {}
-
-    try:
-        url = f"{OPTICODDS_API_BASE}/fixtures/odds/nba"
-        params = {"markets": "moneyline", "event_status": "upcoming"}
-        headers = {"x-api-key": api_key}
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}: {resp.text[:200]}", {}
-        raw = resp.json()
-        return True, "OpticOdds connection OK.", raw
-    except Exception as e:
-        return False, f"Error: {e}", {}
-
-
-def fetch_opticodds_snapshot(
-    api_key: str,
-    sport_code: str,
-    sportsbooks: List[str],
-    min_odds: int,
-    max_odds: int,
-) -> pd.DataFrame:
-    """
-    Pull a snapshot from OpticOdds.
-    No demos, no fake rows.
-    On any error or empty result: returns an empty DataFrame.
-    """
-    if not api_key:
-        st.error("No OpticOdds API key set. Paste it in the sidebar and press 'Test & Use This Key'.")
-        return pd.DataFrame()
-
-    try:
-        url = f"{OPTICODDS_API_BASE}/fixtures/odds/{sport_code}"
-        params = {
-            "sportsbooks": ",".join(sportsbooks) if sportsbooks else None,
-            "markets": "moneyline",
-            "event_status": "upcoming",
-        }
-        headers = {"x-api-key": api_key}
-
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-
-        df = normalize_opticodds_json(raw, sport_code)
-        if df.empty:
-            st.warning("OpticOdds returned no usable rows for this sport / filters.")
-            return pd.DataFrame()
-
-        df = df[(df["current_odds"] >= min_odds) & (df["current_odds"] <= max_odds)]
-        if df.empty:
-            st.info("Live data returned, but nothing inside your odds window.")
-            return pd.DataFrame()
-
-        return df
-
-    except Exception as e:
-        st.error(f"Error while calling OpticOdds: {e}")
-        return pd.DataFrame()
-
-
-def compute_line_movement(df: pd.DataFrame) -> pd.DataFrame:
-    """Add line_move (cents), move_abs, and move_direction columns."""
-    if df.empty:
-        return df
-    df = df.copy()
-    df["line_move"] = df["current_odds"] - df["open_odds"]
-    df["move_abs"] = df["line_move"].abs()
-
-    def _direction(x: float) -> str:
-        if pd.isna(x):
-            return "Unknown"
-        if x > 0:
-            return "Steam toward plus side"
-        if x < 0:
-            return "Steam toward favorite"
-        return "No move"
-
-    df["move_direction"] = df["line_move"].apply(_direction)
-    return df
-
-
-def detect_steam(df: pd.DataFrame, min_move: int) -> pd.DataFrame:
-    """Filter rows with >= min_move cents of line movement."""
-    if df.empty:
-        return df
-    df = compute_line_movement(df)
-    steam = df[df["move_abs"] >= min_move]
-    return steam.sort_values("move_abs", ascending=False)
-
-
-def detect_two_way_arbitrage(df: pd.DataFrame, min_edge_pct: float) -> pd.DataFrame:
-    """Simple 2-way arb finder based on best price each side."""
-    if df.empty:
-        return df
-
-    records = []
-    grouped = df.groupby(["fixture_id", "market_key"])
-
-    for (fixture_id, market_key), group in grouped:
-        best = (
-            group.sort_values("current_odds", ascending=False)
-            .groupby("outcome_key")
-            .head(1)
-        )
-
-        if best["outcome_key"].nunique() != 2:
-            continue
-
-        recs = list(best.to_dict("records"))
-        r1, r2 = recs[0], recs[1]
-
-        d1 = american_to_decimal(r1["current_odds"])
-        d2 = american_to_decimal(r2["current_odds"])
-
-        inv_sum = (1.0 / d1) + (1.0 / d2)
-        if inv_sum >= 1.0:
-            continue
-
-        edge = (1.0 - inv_sum) * 100.0
-        if edge < min_edge_pct:
-            continue
-
-        records.append(
+    agg_rows: List[Dict[str, Any]] = []
+    for key, grp in df.groupby(key_cols):
+        first = grp.iloc[0]
+        last = grp.iloc[-1]
+        open_price = float(first["price"])
+        curr_price = float(last["price"])
+        move = curr_price - open_price
+        agg_rows.append(
             dict(
-                fixture_id=fixture_id,
-                league=r1["league"],
-                start_time=r1["start_time"],
-                home_team=r1["home_team"],
-                away_team=r1["away_team"],
-                market_key=market_key,
-                outcome1=r1["outcome_name"],
-                book1=r1["bookmaker"],
-                odds1=r1["current_odds"],
-                outcome2=r2["outcome_name"],
-                book2=r2["bookmaker"],
-                odds2=r2["current_odds"],
-                arb_edge_pct=round(edge, 2),
+                fixture_id=key[0],
+                sportsbook=key[1],
+                market=key[2],
+                selection=key[3],
+                league=str(last["league"]),
+                sport=str(last["sport"]),
+                open_odds=open_price,
+                current_odds=curr_price,
+                line_move=move,
+                move_abs=abs(move),
+                last_timestamp=float(last["timestamp"]),
             )
         )
 
+    if not agg_rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(agg_rows)
+    out["move_direction"] = out["line_move"].apply(
+        lambda x: "Steam to dog" if x > 0 else ("Steam to fav" if x < 0 else "Flat")
+    )
+    return out.sort_values("move_abs", ascending=False)
+
+
+def detect_arbitrage(df: pd.DataFrame, min_edge_pct: float) -> pd.DataFrame:
+    """Very simple two-way arb finder off latest prices."""
+    if df.empty:
+        return df
+
+    records: List[Dict[str, Any]] = []
+    grouped = df.groupby(["fixture_id", "market"])
+
+    for (fixture_id, market), grp in grouped:
+        best = grp.sort_values("current_odds", ascending=False).groupby("selection").head(1)
+        if best["selection"].nunique() != 2:
+            continue
+        recs = list(best.to_dict("records"))
+        a, b = recs[0], recs[1]
+        d1 = american_to_decimal(a["current_odds"])
+        d2 = american_to_decimal(b["current_odds"])
+        inv_sum = 1.0 / d1 + 1.0 / d2
+        if inv_sum >= 1.0:
+            continue
+        edge = (1.0 - inv_sum) * 100.0
+        if edge < min_edge_pct:
+            continue
+        records.append(
+            dict(
+                fixture_id=fixture_id,
+                market=market,
+                selection1=a["selection"],
+                book1=a["sportsbook"],
+                odds1=a["current_odds"],
+                selection2=b["selection"],
+                book2=b["sportsbook"],
+                odds2=b["current_odds"],
+                arb_edge_pct=round(edge, 2),
+            )
+        )
     if not records:
         return pd.DataFrame()
     return pd.DataFrame(records).sort_values("arb_edge_pct", ascending=False)
 
 
+def test_key_once(api_key: str) -> Tuple[bool, str]:
+    """Quick smoke test: open NBA moneyline stream."""
+    try:
+        url = f"{OPTICODDS_API_BASE}/stream/odds/basketball"
+        params = {
+            "key": api_key,
+            "sportsbook": ["DraftKings"],
+            "market": ["Moneyline"],
+            "league": ["NBA"],
+        }
+        resp = requests.get(url, params=params, stream=True, timeout=6)
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code}: {resp.text[:180]}"
+        _ = next(resp.iter_lines(decode_unicode=True), None)
+        resp.close()
+        return True, "Stream opened successfully."
+    except Exception as e:
+        return False, str(e)
+
 # ============================================================
-#  SIDEBAR – CONTROL PANEL
+#  SIDEBAR – CONTROLS
 # ============================================================
 
-st.sidebar.markdown("## ⚙️ Edge Force Control Panel")
+st.sidebar.markdown("## ⚙️ Edge Force Control")
 
-# Session state for key + test result
 if "optic_key" not in st.session_state:
     st.session_state["optic_key"] = ""
-if "test_ok" not in st.session_state:
-    st.session_state["test_ok"] = None
-if "test_message" not in st.session_state:
-    st.session_state["test_message"] = ""
-if "test_raw" not in st.session_state:
-    st.session_state["test_raw"] = {}
+if "key_status" not in st.session_state:
+    st.session_state["key_status"] = None
+if "key_message" not in st.session_state:
+    st.session_state["key_message"] = ""
 
-api_key_input = st.sidebar.text_input("OpticOdds API Key", type="password")
+key_input = st.sidebar.text_input("OpticOdds API Key", type="password")
 
-if st.sidebar.button("🔌 Test & Use This Key"):
-    key = api_key_input.strip()
-    st.session_state["optic_key"] = key
-    ok, msg, raw = test_opticodds_connection(key)
-    st.session_state["test_ok"] = ok
-    st.session_state["test_message"] = msg
-    st.session_state["test_raw"] = raw
+if st.sidebar.button("🔌 Test & Use Key"):
+    st.session_state["optic_key"] = key_input.strip()
+    ok, msg = test_key_once(st.session_state["optic_key"])
+    st.session_state["key_status"] = ok
+    st.session_state["key_message"] = msg
 
-mode = st.sidebar.radio(
-    "Radar Mode",
-    ["🔥 Steam / Line Movement", "♟️ Arbitrage Radar"],
-)
+mode = st.sidebar.radio("Mode", ["🔥 Steam / Line Move", "♟️ Arbitrage Radar"])
 
-books = st.sidebar.multiselect(
-    "Sportsbooks",
-    BOOKS_ALL,
-    default=BOOKS_ALL,
-)
+books = st.sidebar.multiselect("Sportsbooks", BOOKS_ALL, default=BOOKS_ALL)
+min_move = st.sidebar.slider("Min line move (cents)", 5, 100, 20)
+min_arb_edge = st.sidebar.slider("Min arb edge (%)", 0.1, 5.0, 0.5)
+burst_events = st.sidebar.slider("Events per refresh (per sport)", 40, 400, 160, step=40)
 
-min_odds, max_odds = st.sidebar.slider(
-    "Odds window (American)",
-    -1000,
-    1000,
-    (-250, 250),
-)
-
-min_move = st.sidebar.slider(
-    "Steam threshold (cents)",
-    5,
-    80,
-    20,
-)
-
-min_arb_edge = st.sidebar.slider(
-    "Min arbitrage edge (%)",
-    0.1,
-    5.0,
-    0.5,
-)
-
-if st.sidebar.button("🔄 Refresh data"):
+if st.sidebar.button("🔄 Pull fresh stream burst"):
     st.experimental_rerun()
 
 active_key = st.session_state["optic_key"]
 
 # ============================================================
-#  HEADER + CONNECTION STATUS
+#  HEADER
 # ============================================================
 
 st.markdown(
     """
 <div class="efd-card">
-  <h1 style="margin-bottom:0.25rem;">🏆 Edge Force Dominion – Live Deck</h1>
-  <p style="opacity:0.88;margin-bottom:0.35rem;">
-    Real-time steam, line movement and cross-book arbitrage radar. No fake data, ever.
+  <h1 style="margin-bottom:0.25rem;">🏆 Edge Force Dominion — Live OpticOdds Stream</h1>
+  <p style="opacity:0.9;margin-bottom:0;">
+    Straight from <code>/stream/odds/{sport}</code>. No demos, no fake rows. 
+    Prices update based on the last burst of SSE events.
   </p>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-if st.session_state["test_ok"] is True:
-    st.success(f"OpticOdds: {st.session_state['test_message']}")
-elif st.session_state["test_ok"] is False:
-    st.error(f"OpticOdds: {st.session_state['test_message']}")
+if st.session_state["key_status"] is True:
+    st.success(f"OpticOdds stream: {st.session_state['key_message']}")
+elif st.session_state["key_status"] is False:
+    st.error(f"OpticOdds stream: {st.session_state['key_message']}")
 else:
-    st.info("Paste your OpticOdds key in the sidebar and press '🔌 Test & Use This Key'.")
-
-if st.session_state["test_raw"]:
-    with st.expander("DEBUG: Raw OpticOdds JSON from test call"):
-        st.json(st.session_state["test_raw"])
+    st.info("Paste your key and hit '🔌 Test & Use Key' to verify the stream.")
 
 st.markdown("---")
 
 # ============================================================
-#  TABS – ONE PER SPORT
+#  TABS PER SPORT
 # ============================================================
 
-tabs = st.tabs(list(SPORTS.keys()))
+tabs = st.tabs(list(SPORT_MAP.keys()))
 
-for (label, sport_code), tab in zip(SPORTS.items(), tabs):
+for tab_label, tab in zip(SPORT_MAP.keys(), tabs):
     with tab:
-        left, right = st.columns([1.6, 1.0])
+        cfg = SPORT_MAP[tab_label]
+        sport = cfg["sport"]
+        leagues = cfg["leagues"]
 
-        with left:
-            st.markdown(f"### {label} – {mode}")
+        st.markdown(f"### {tab_label} — {mode}")
 
-        df_snapshot = fetch_opticodds_snapshot(
+        if not active_key:
+            st.warning("No API key set.")
+            continue
+
+        # pull a burst of events for this sport
+        df = stream_odds_once(
             api_key=active_key,
-            sport_code=sport_code,
+            sport=sport,
+            leagues=leagues,
             sportsbooks=books,
-            min_odds=min_odds,
-            max_odds=max_odds,
+            markets=["Moneyline"],
+            max_events=burst_events,
         )
 
-        with left:
-            if df_snapshot.empty:
-                st.info("No live rows for this sport with current filters.")
-            else:
-                if "Steam" in mode:
-                    steam_df = detect_steam(df_snapshot, min_move)
-                    if steam_df.empty:
-                        st.success("No steam above your threshold.")
-                    else:
-                        view = steam_df[
-                            [
-                                "league",
-                                "start_time",
-                                "home_team",
-                                "away_team",
-                                "market_name",
-                                "bookmaker",
-                                "open_odds",
-                                "current_odds",
-                                "line_move",
-                                "move_direction",
-                                "last_updated",
-                            ]
-                        ]
-                        st.dataframe(view, use_container_width=True, hide_index=True)
-                else:
-                    arb_df = detect_two_way_arbitrage(df_snapshot, min_arb_edge)
-                    if arb_df.empty:
-                        st.success("No 2-way arbitrage edges above threshold.")
-                    else:
-                        st.dataframe(arb_df, use_container_width=True, hide_index=True)
+        if df.empty:
+            st.info("No odds came through in this burst (for this sport / filters).")
+            continue
 
-        with right:
-            st.markdown("### 📊 Raw odds snapshot")
-            if df_snapshot.empty:
-                st.write("No odds to show.")
+        if mode.startswith("🔥"):  # steam view
+            steam_df = df[df["move_abs"] >= min_move]
+            if steam_df.empty:
+                st.success("No steam above your threshold in this burst.")
             else:
-                base_view = df_snapshot[
+                view = steam_df[
                     [
                         "league",
-                        "start_time",
-                        "home_team",
-                        "away_team",
-                        "market_name",
-                        "outcome_name",
-                        "bookmaker",
+                        "market",
+                        "selection",
+                        "sportsbook",
                         "open_odds",
                         "current_odds",
-                        "last_updated",
+                        "line_move",
+                        "move_direction",
                     ]
-                ].sort_values("start_time")
-                st.dataframe(base_view, use_container_width=True, hide_index=True)
+                ]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            arb_df = detect_arbitrage(df, min_arb_edge)
+            if arb_df.empty:
+                st.success("No clear 2-way arbitrage in this burst.")
+            else:
+                st.dataframe(arb_df, use_container_width=True, hide_index=True)
