@@ -1,45 +1,52 @@
-# streamlit_app.py
-# EDGE FORCE DOMINION – Multi-sport OpticOdds dashboard (poll + history)
-# NOTE: you may need to tweak a few parameter names to match the live OpticOdds docs.
-
+import os
 import time
+import math
 import json
-from datetime import datetime, timezone
+from typing import List, Dict, Any, Tuple
 
 import requests
 import pandas as pd
-import numpy as np
 import streamlit as st
 
+# =========================
+#  BASIC CONFIG
+# =========================
 
-# ======================================
-#  CONFIG
-# ======================================
+BASE_URL = "https://api.opticodds.com/api/v3"
 
-OPTIC_BASE = "https://api.opticodds.com/api/v3"
-
-# Tabs = high-level sports. We’ll show real leagues from the data.
-SPORT_KEYS = {
-    "🏀 Basketball": "basketball",
-    "🏈 Football": "football",
-    "⚾ Baseball": "baseball",
-    "🏒 Hockey": "hockey",
+US_SPORTS = {
+    "NBA": "basketball_nba",
+    "NCAAB": "basketball_ncaab",
+    "NFL": "americanfootball_nfl",
+    "NCAAF": "americanfootball_ncaaf",
+    "MLB": "baseball_mlb",
+    "NHL": "icehockey_nhl",
 }
 
-DEFAULT_BOOKS = ["FanDuel", "DraftKings", "BetMGM", "Caesars", "Pinnacle", "LowVig"]
-DEFAULT_MARKETS = ["moneyline", "point_spread", "total_points"]
+DEFAULT_SPORTBOOKS = [
+    "FanDuel",
+    "DraftKings",
+    "BetMGM",
+    "Caesars",
+    "Pinnacle",
+    "LowVig",
+]
 
+DEFAULT_MARKETS = [
+    "moneyline",
+    "point_spread",
+    "total_points",
+]
 
-# ======================================
-#  UTILS
-# ======================================
+SESSION_KEY_SNAPSHOT = "efd_snapshot_df"
+SESSION_KEY_FIXTURES = "efd_fixtures_df"
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+# =========================
+#  HELPERS
+# =========================
 
-
-def american_to_decimal(odds):
-    """Safe American → decimal."""
+def american_to_decimal(odds: Any) -> float:
+    """Convert American odds to decimal, safe against junk."""
     try:
         o = float(odds)
     except Exception:
@@ -48,580 +55,655 @@ def american_to_decimal(odds):
         return 1.0
     if o > 0:
         return 1.0 + (o / 100.0)
-    return 1.0 + (100.0 / abs(o))
+    else:
+        return 1.0 + (100.0 / abs(o))
 
 
-def ensure_df(obj):
-    if isinstance(obj, pd.DataFrame):
-        return obj
-    if not obj:
+def ev_from_implied_vs_offer(implied_prob: float, price_dec: float) -> float:
+    """Expected value given implied 'true' prob and offered decimal price."""
+    offer_prob = 1.0 / price_dec if price_dec != 0 else 0.0
+    edge = (implied_prob * price_dec) - 1.0
+    return edge
+
+
+def safe_get(url: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+    """GET with basic error handling – returns JSON or raises."""
+    resp = requests.get(url, params=params, timeout=timeout)
+    if not resp.ok:
+        raise RuntimeError(f"{resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def chunk_list(items: List[Any], chunk_size: int) -> List[List[Any]]:
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+# =========================
+#  OPTICODDS – SNAPSHOT
+# =========================
+
+def fetch_active_fixtures(
+    api_key: str,
+    sports: List[str],
+    max_per_sport: int = 50,
+) -> pd.DataFrame:
+    """
+    Hit /fixtures/active for each selected sport.
+    Returns a combined fixtures DataFrame.
+    """
+    all_rows = []
+
+    for label, sport_code in US_SPORTS.items():
+        if label not in sports:
+            continue
+
+        try:
+            params = {
+                "key": api_key,
+                "sport": sport_code,
+                "event_status": "upcoming",  # upcoming / live / closed
+            }
+            data = safe_get(f"{BASE_URL}/fixtures/active", params=params)
+        except Exception as e:
+            st.error(f"{label}: error fetching fixtures – {e}")
+            continue
+
+        fixtures = data.get("fixtures", data)  # depending on API shape
+        if not fixtures:
+            continue
+
+        for fx in fixtures[:max_per_sport]:
+            all_rows.append(
+                {
+                    "sport_label": label,
+                    "sport_code": sport_code,
+                    "fixture_id": fx.get("fixture_id"),
+                    "home_team": fx.get("home_team"),
+                    "away_team": fx.get("away_team"),
+                    "commence_time": fx.get("commence_time"),
+                    "league": fx.get("league"),
+                }
+            )
+
+    if not all_rows:
         return pd.DataFrame()
-    return pd.DataFrame(obj)
+
+    return pd.DataFrame(all_rows)
 
 
-def chunk(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-# ======================================
-#  OPTICODDS HELPERS
-# ======================================
-
-def fetch_fixtures(api_key: str, sport_slug: str, max_events: int = 100,
-                   event_status: str = "upcoming") -> list:
+def fetch_odds_for_fixtures(
+    api_key: str,
+    sport_label: str,
+    sport_code: str,
+    fixture_ids: List[str],
+    sportsbooks: List[str],
+    markets: List[str],
+    chunk_size: int = 10,
+) -> List[Dict[str, Any]]:
     """
-    Fetch fixtures (schedule) for a given high-level sport.
-
-    ⚠️ TODO: Check OpticOdds docs:
-    - If 'league' is required, add it.
-    - If sport is named 'american_football' instead of 'football', adjust SPORT_KEYS.
+    For a list of fixture_ids, call /fixtures/odds in chunks.
+    Returns list of rows, one row per (fixture, book, market, selection).
     """
-    params = {
-        "key": api_key,
-        "sport": sport_slug,
-        "event_status": event_status,   # 'upcoming', 'live', etc.
-        "page_size": max_events,
-    }
-    try:
-        r = requests.get(f"{OPTIC_BASE}/fixtures", params=params, timeout=12)
-        r.raise_for_status()
-    except Exception as e:
-        st.error(f"{sport_slug}: error fetching fixtures: {e}")
-        return []
+    all_rows: List[Dict[str, Any]] = []
 
-    return r.json().get("data", [])
-
-
-def fetch_odds_snapshot(api_key: str,
-                        fixture_ids: list,
-                        sportsbooks: list,
-                        markets: list) -> list:
-    """
-    Snapshot odds for a list of fixtures.
-
-    ⚠️ THIS IS THE PLACE MOST LIKELY TO NEED A SMALL ADJUSTMENT.
-
-    Two common styles:
-    1) Repeated params:
-       ?fixture_id=A&fixture_id=B&sportsbook=FanDuel&sportsbook=DK&market=moneyline
-    2) Comma-separated:
-       ?fixture_ids=A,B&sportsbooks=FanDuel,DraftKings&markets=moneyline,total_points
-
-    I’ll implement the COMMA style as it’s less likely to 400; if you still see 400,
-    swap to style (1) using multiple tuples instead.
-    """
-
-    if not fixture_ids or not sportsbooks or not markets:
-        return []
-
-    fixture_ids = list(dict.fromkeys(fixture_ids))
-    sportsbooks = list(dict.fromkeys(sportsbooks))
-    markets = list(dict.fromkeys(markets))
-
-    rows = []
-
-    # OpticOdds will usually have some limit; chunk to be safe.
-    for fixture_chunk in chunk(fixture_ids, 25):
+    for fixture_chunk in chunk_list(fixture_ids, chunk_size):
         params = {
             "key": api_key,
-            # ⚠️ TODO: confirm param names; try 'fixture_ids' / 'sportsbooks' / 'markets'
+            "sport": sport_code,
             "fixture_ids": ",".join(fixture_chunk),
             "sportsbooks": ",".join(sportsbooks),
             "markets": ",".join(markets),
             "is_main": "True",
         }
         try:
-            r = requests.get(f"{OPTIC_BASE}/fixtures/odds", params=params, timeout=12)
-            r.raise_for_status()
+            data = safe_get(f"{BASE_URL}/fixtures/odds", params=params)
         except Exception as e:
-            st.error(f"Snapshot odds error: {e}")
-            continue
-
-        data = r.json().get("data", [])
-        for f in data:
-            fixture_id = f.get("id")
-            sport = f.get("sport")
-            league = f.get("league")
-            home = f.get("home_team")
-            away = f.get("away_team")
-            start_time = f.get("start_time")
-
-            for o in f.get("odds", []):
-                price_dec = o.get("price_decimal")
-                if price_dec is None:
-                    price_dec = american_to_decimal(o.get("price_american"))
-
-                rows.append(
-                    {
-                        "source": "snapshot",
-                        "ingest_ts": now_iso(),
-                        "fixture_id": fixture_id,
-                        "sport": sport,
-                        "league": league,
-                        "home_team": home,
-                        "away_team": away,
-                        "start_time": start_time,
-                        "sportsbook": o.get("sportsbook"),
-                        "market": o.get("market"),
-                        "selection": o.get("selection"),
-                        "price_american": o.get("price_american"),
-                        "price_decimal": price_dec,
-                    }
-                )
-
-    return rows
-
-
-# ======================================
-#  EFD SCORING & ARBITRAGE
-# ======================================
-
-def compute_efd_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Very simple EFD v1: higher score = more mispricing + more dispersion across books.
-
-    Inputs: all odds rows for a set of fixtures.
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    scored_rows = []
-    # Group at fixture + market + selection level
-    for (fixture_id, league, market, selection), grp in df.groupby(
-        ["fixture_id", "league", "market", "selection"]
-    ):
-        dec = grp["price_decimal"].astype(float)
-        best = dec.max()
-        worst = dec.min()
-        spread = best - worst
-        # "Edge" as best vs average
-        edge_pct = (best / dec.mean()) - 1.0 if dec.mean() > 0 else 0.0
-
-        # Map into 0–100: baseline 40, plus boosts capped
-        score = 40 + 300 * edge_pct + 20 * spread
-        score = max(0, min(100, score))
-
-        scored_rows.append(
-            {
-                "fixture_id": fixture_id,
-                "league": league,
-                "market": market,
-                "selection": selection,
-                "EFD_score": score,
-                "best_price": best,
-                "worst_price": worst,
-                "books": ",".join(sorted(set(grp["sportsbook"]))),
-            }
-        )
-
-    return pd.DataFrame(scored_rows).sort_values("EFD_score", ascending=False)
-
-
-def detect_arbitrage(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Simple cross-book arbitrage detector.
-
-    For each fixture + market, compute best decimal price for each unique selection.
-    If sum(1/best_price) < 1 → theoretical arbitrage.
-
-    This works nicely for 2-way (moneyline, spread) and 3-way (soccer) markets.
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    arb_rows = []
-    for (fixture_id, league, market), grp in df.groupby(["fixture_id", "league", "market"]):
-        # Best odds by outcome
-        outcome_best = (
-            grp.groupby("selection")["price_decimal"]
-            .max()
-            .reset_index()
-        )
-
-        if outcome_best.empty:
-            continue
-
-        inv_sum = (1.0 / outcome_best["price_decimal"]).sum()
-        if inv_sum < 1.0:
-            profit_pct = (1.0 - inv_sum) * 100.0
-            arb_rows.append(
-                {
-                    "fixture_id": fixture_id,
-                    "league": league,
-                    "market": market,
-                    "num_outcomes": len(outcome_best),
-                    "inv_sum": inv_sum,
-                    "arb_yield_pct": profit_pct,
-                    "outcomes": "; ".join(
-                        f'{row.selection}@{row.price_decimal:.2f}'
-                        for _, row in outcome_best.iterrows()
-                    ),
-                }
+            st.error(
+                f"{sport_label}: snapshot odds error (fixtures {fixture_chunk[0]}..): {e}"
             )
+            continue
 
-    return pd.DataFrame(arb_rows).sort_values("arb_yield_pct", ascending=False)
+        # Shape is typically list of fixtures, each with markets → outcomes
+        fixtures = data.get("fixtures", data)
+        for fx in fixtures:
+            fx_id = fx.get("fixture_id")
+            league = fx.get("league")
+            home = fx.get("home_team")
+            away = fx.get("away_team")
+            commence = fx.get("commence_time")
+
+            books = fx.get("sportsbooks", [])
+            for book in books:
+                book_name = book.get("key") or book.get("sportsbook") or "Unknown"
+
+                mkts = book.get("markets", [])
+                for mkt in mkts:
+                    mkt_key = mkt.get("key") or mkt.get("market")
+                    outcomes = mkt.get("outcomes", [])
+
+                    for out in outcomes:
+                        sel_name = out.get("name")
+                        price_american = out.get("price")
+                        price_dec = american_to_decimal(price_american)
+
+                        all_rows.append(
+                            {
+                                "sport_label": sport_label,
+                                "sport_code": sport_code,
+                                "fixture_id": fx_id,
+                                "league": league,
+                                "home_team": home,
+                                "away_team": away,
+                                "commence_time": commence,
+                                "sportsbook": book_name,
+                                "market": mkt_key,
+                                "selection": sel_name,
+                                "price_american": price_american,
+                                "price_decimal": price_dec,
+                            }
+                        )
+
+    return all_rows
 
 
-def compute_line_moves(history_df: pd.DataFrame) -> pd.DataFrame:
+def build_snapshot(
+    api_key: str,
+    sports: List[str],
+    sportsbooks: List[str],
+    markets: List[str],
+    max_per_sport: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Use all historical snapshots in session_state to compute open vs current odds.
+    Full snapshot:
+    - fixtures_df: every fixture we found
+    - odds_df: every odds row (fixture/book/market/selection)
     """
-    if history_df.empty:
+    fixtures_df = fetch_active_fixtures(api_key, sports, max_per_sport=max_per_sport)
+    if fixtures_df.empty:
+        return fixtures_df, pd.DataFrame()
+
+    odds_rows: List[Dict[str, Any]] = []
+
+    for sport_label in fixtures_df["sport_label"].unique():
+        sport_fixture_df = fixtures_df[fixtures_df["sport_label"] == sport_label]
+        sport_code = sport_fixture_df["sport_code"].iloc[0]
+
+        fixture_ids = sport_fixture_df["fixture_id"].dropna().unique().tolist()
+        if not fixture_ids:
+            continue
+
+        rows = fetch_odds_for_fixtures(
+            api_key=api_key,
+            sport_label=sport_label,
+            sport_code=sport_code,
+            fixture_ids=fixture_ids,
+            sportsbooks=sportsbooks,
+            markets=markets,
+        )
+        odds_rows.extend(rows)
+
+    odds_df = pd.DataFrame(odds_rows)
+    return fixtures_df, odds_df
+
+
+# =========================
+#  EDGE FORCE – SCORING
+# =========================
+
+def compute_efd_scores(odds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Very simple v1 EFD scoring:
+    - For each fixture & side:
+        * compute avg price across books (decimal).
+        * compute implied "consensus" probability.
+        * compute book dispersion (max-min price across books).
+        * EFD_score = combo of advantage vs worst line & dispersion.
+    """
+    if odds_df.empty:
         return pd.DataFrame()
 
-    history_df = history_df.copy()
-    history_df["ingest_ts"] = pd.to_datetime(history_df["ingest_ts"])
+    # Moneyline only for EFD v1
+    df = odds_df[odds_df["market"] == "moneyline"].copy()
+    if df.empty:
+        return pd.DataFrame()
 
-    records = []
-    for (fixture_id, league, market, selection, sportsbook), grp in history_df.groupby(
-        ["fixture_id", "league", "market", "selection", "sportsbook"]
-    ):
-        grp_sorted = grp.sort_values("ingest_ts")
-        open_price = float(grp_sorted.iloc[0]["price_decimal"])
-        curr_price = float(grp_sorted.iloc[-1]["price_decimal"])
-        move = curr_price - open_price
+    # Basic aggregation per fixture & selection
+    grouped = df.groupby(["fixture_id", "sport_label", "selection", "home_team", "away_team"])
 
-        records.append(
+    rows = []
+    for (fixture_id, sport_label, sel, home, away), grp in grouped:
+        prices = grp["price_decimal"].astype(float)
+        if prices.empty:
+            continue
+
+        avg_price = prices.mean()
+        best_price = prices.max()
+        worst_price = prices.min()
+        implied_consensus = 1.0 / avg_price if avg_price != 0 else 0.0
+
+        # "Value" – how much better the best price is vs consensus expectation
+        ev_edge = ev_from_implied_vs_offer(implied_consensus, best_price)
+
+        dispersion = best_price - worst_price
+
+        # Map to 0–100 (rough heuristic)
+        base_score = (ev_edge * 1000.0) + (dispersion * 10.0)
+        base_score = max(-20.0, min(base_score, 80.0))
+        efd_score = 50.0 + base_score
+
+        rows.append(
             {
                 "fixture_id": fixture_id,
-                "league": league,
-                "market": market,
-                "selection": selection,
-                "sportsbook": sportsbook,
-                "open_odds": open_price,
-                "current_odds": curr_price,
-                "line_move": move,
-                "move_abs": abs(move),
-                "direction": (
-                    "Steam to dog" if move > 0
-                    else ("Steam to fav" if move < 0 else "Flat")
-                ),
+                "sport_label": sport_label,
+                "home_team": home,
+                "away_team": away,
+                "selection": sel,
+                "avg_price": round(avg_price, 3),
+                "best_price": round(best_price, 3),
+                "worst_price": round(worst_price, 3),
+                "implied_prob": round(implied_consensus, 3),
+                "ev_edge": round(ev_edge, 4),
+                "dispersion": round(dispersion, 3),
+                "EFD_score": round(efd_score, 1),
             }
         )
 
-    return pd.DataFrame(records).sort_values("move_abs", ascending=False)
+    scored = pd.DataFrame(rows)
+    if scored.empty:
+        return scored
+
+    return scored.sort_values("EFD_score", ascending=False)
 
 
-# ======================================
-#  STREAMLIT LAYOUT & STATE
-# ======================================
+# =========================
+#  ARBITRAGE ENGINE
+# =========================
 
-st.set_page_config(
-    page_title="EDGE FORCE DOMINION – OpticOdds Live",
-    page_icon="🏆",
-    layout="wide",
-)
-
-# --- Neon-dark theme styling
-st.markdown(
+def detect_arbitrage(odds_df: pd.DataFrame) -> pd.DataFrame:
     """
-    <style>
-    body {
-        background-color: #050816;
-        color: #f8fafc;
-    }
-    .stApp {
-        background: radial-gradient(circle at top, #172554 0, #020617 55%, #000 100%);
-    }
-    .efd-card {
-        border-radius: 16px;
-        padding: 1rem 1.25rem;
-        background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(15,118,110,0.35));
-        box-shadow: 0 0 30px rgba(34,211,238,0.25);
-        border: 1px solid rgba(56,189,248,0.45);
-    }
-    .efd-header {
-        font-size: 1.4rem;
-        font-weight: 700;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# --- Session state
-if "odds_history" not in st.session_state:
-    st.session_state.odds_history = pd.DataFrame()
-
-if "last_snapshot_ts" not in st.session_state:
-    st.session_state.last_snapshot_ts = None
-
-# ======================================
-#  SIDEBAR CONFIG
-# ======================================
-
-st.sidebar.title("⚙️ Configuration")
-
-api_key = st.sidebar.text_input("OpticOdds API Key", type="password")
-
-selected_sports_labels = st.sidebar.multiselect(
-    "Sports",
-    list(SPORT_KEYS.keys()),
-    default=list(SPORT_KEYS.keys()),
-)
-
-selected_books = st.sidebar.multiselect(
-    "Sportsbooks",
-    DEFAULT_BOOKS,
-    default=DEFAULT_BOOKS,
-)
-
-selected_markets = st.sidebar.multiselect(
-    "Markets",
-    DEFAULT_MARKETS,
-    default=["moneyline"],
-)
-
-max_events = st.sidebar.slider(
-    "Max fixtures per sport (snapshot)",
-    min_value=10, max_value=200, value=60, step=10,
-)
-
-include_live = st.sidebar.checkbox("Include live games", value=True)
-
-run_snapshot = st.sidebar.button("Run Snapshot Pull Now")
-
-st.sidebar.markdown("---")
-auto_refresh = st.sidebar.checkbox("Auto-refresh every 30s", value=False)
-if auto_refresh:
-    st.sidebar.write("App will re-run itself every ~30 seconds.")
-
-
-# ======================================
-#  HEADER
-# ======================================
-
-st.markdown(
+    Detect crude multi-book arb on 2-way & 3-way moneylines.
     """
-    <div class="efd-card">
-      <div class="efd-header">🏆 EDGE FORCE DOMINION – OpticOdds Live Engine</div>
-      <div>Multi-sport odds ingestion, EFD scoring, arbitrage radar, and line-move tracking over your OpticOdds feed.</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.write("")
+    if odds_df.empty:
+        return pd.DataFrame()
 
+    df = odds_df[odds_df["market"] == "moneyline"].copy()
+    if df.empty:
+        return pd.DataFrame()
 
-# ======================================
-#  DATA PULL
-# ======================================
+    # We assume selection names like "Home", "Away", "Draw" or team names.
+    rows = []
+    for fixture_id, grp in df.groupby("fixture_id"):
+        # map selection -> best (highest) decimal price & book
+        sel_best = {}
+        for sel, sgrp in grp.groupby("selection"):
+            idx = sgrp["price_decimal"].astype(float).idxmax()
+            row = sgrp.loc[idx]
+            sel_best[sel] = (row["price_decimal"], row["sportsbook"])
 
-if auto_refresh:
-    # this triggers a silent periodic rerun
-    st.experimental_rerun()
-
-odds_all = st.session_state.odds_history.copy()
-
-if api_key and run_snapshot:
-    total_new_rows = 0
-    all_fixture_ids = []
-
-    # 1) fixtures per selected sport
-    for label in selected_sports_labels:
-        sport_slug = SPORT_KEYS[label]
-        status = "live" if include_live else "upcoming"
-        fixtures = fetch_fixtures(api_key, sport_slug, max_events, event_status=status)
-        if not fixtures:
+        if len(sel_best) < 2:
             continue
 
-        fixture_ids = [f.get("id") for f in fixtures if f.get("id")]
-        all_fixture_ids.extend(fixture_ids)
+        inv_sum = sum(1.0 / price for price, _ in sel_best.values() if price > 0)
+        if inv_sum <= 0:
+            continue
 
-    all_fixture_ids = list(dict.fromkeys(all_fixture_ids))
+        arb_pct = 1.0 - inv_sum
+        if arb_pct <= 0:
+            continue  # not an arb
 
-    # 2) odds snapshot for those fixtures
-    snapshot_rows = fetch_odds_snapshot(
-        api_key=api_key,
-        fixture_ids=all_fixture_ids,
-        sportsbooks=selected_books,
-        markets=selected_markets,
+        # Build human-friendly description
+        legs = []
+        for sel, (price, book) in sel_best.items():
+            legs.append(f"{sel} @ {book} ({round(price,3)})")
+
+        any_row = grp.iloc[0]
+        sport_label = any_row["sport_label"]
+        home_team = any_row["home_team"]
+        away_team = any_row["away_team"]
+
+        rows.append(
+            {
+                "fixture_id": fixture_id,
+                "sport_label": sport_label,
+                "matchup": f"{away_team} @ {home_team}",
+                "legs": " | ".join(legs),
+                "edge_percent": round(arb_pct * 100.0, 2),
+            }
+        )
+
+    arb_df = pd.DataFrame(rows)
+    if arb_df.empty:
+        return arb_df
+
+    return arb_df.sort_values("edge_percent", ascending=False)
+
+
+# =========================
+#  UI – THEME & LAYOUT
+# =========================
+
+def init_session():
+    if SESSION_KEY_SNAPSHOT not in st.session_state:
+        st.session_state[SESSION_KEY_SNAPSHOT] = pd.DataFrame()
+    if SESSION_KEY_FIXTURES not in st.session_state:
+        st.session_state[SESSION_KEY_FIXTURES] = pd.DataFrame()
+
+
+def sidebar_controls() -> Dict[str, Any]:
+    st.sidebar.title("⚙️ Edge Force Config")
+
+    api_key = st.sidebar.text_input(
+        "OpticOdds API key",
+        value=os.getenv("OPTICODDS_API_KEY", ""),
+        type="password",
+        help="Paste the key Abe sent you.",
     )
 
-    if snapshot_rows:
-        new_df = pd.DataFrame(snapshot_rows)
-        total_new_rows = len(new_df)
-        st.session_state.odds_history = pd.concat(
-            [st.session_state.odds_history, new_df], ignore_index=True
-        )
-        st.session_state.last_snapshot_ts = now_iso()
-        odds_all = st.session_state.odds_history.copy()
+    st.sidebar.markdown("---")
 
-    st.success(f"Snapshot complete. New rows ingested: {total_new_rows}")
-
-# --- derived views
-odds_all = ensure_df(odds_all)
-unique_sports = sorted(odds_all["sport"].dropna().unique()) if not odds_all.empty else []
-unique_leagues = sorted(odds_all["league"].dropna().unique()) if not odds_all.empty else []
-
-
-# ======================================
-#  TOP-LEVEL TABS
-# ======================================
-
-tab_dash, tab_arb, tab_moves, tab_analytics = st.tabs(
-    ["🏠 Dashboard", "💰 Arbitrage", "📈 Line Moves", "📊 Analytics"]
-)
-
-# ------------------ DASHBOARD ------------------ #
-
-with tab_dash:
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Sports w/ data",
-            len(unique_sports),
-        )
-    with col2:
-        st.metric(
-            "Leagues detected",
-            len(unique_leagues),
-        )
-    with col3:
-        st.metric(
-            "Total odds rows",
-            len(odds_all),
-        )
-    with col4:
-        st.metric(
-            "Last snapshot",
-            st.session_state.last_snapshot_ts or "–",
-        )
-
-    st.write("")
-
-    if odds_all.empty:
-        st.info("No odds data yet. Enter your key and click **Run Snapshot Pull Now**.")
+    # Sports
+    sport_labels = list(US_SPORTS.keys())
+    sports_choice = st.sidebar.multiselect(
+        "Sports",
+        options=["ALL"] + sport_labels,
+        default=["ALL"],
+        help="Choose which US sports you want to ingest.",
+    )
+    if "ALL" in sports_choice:
+        sports_selected = sport_labels
     else:
-        # Sport / league filters
-        fcol1, fcol2 = st.columns(2)
-        with fcol1:
-            sport_filter = st.multiselect(
-                "Filter by sport",
-                options=unique_sports,
-                default=unique_sports,
-            )
-        with fcol2:
-            league_filter = st.multiselect(
-                "Filter by league",
-                options=unique_leagues,
-                default=unique_leagues,
-            )
+        sports_selected = sports_choice or sport_labels
 
-        view_df = odds_all.copy()
-        if sport_filter:
-            view_df = view_df[view_df["sport"].isin(sport_filter)]
-        if league_filter:
-            view_df = view_df[view_df["league"].isin(league_filter)]
-
-        efd_df = compute_efd_scores(view_df)
-
-        st.markdown("### 🔬 Top EFD Edges (selection-level)")
-        if efd_df.empty:
-            st.info("No edges yet – pull another snapshot.")
-        else:
-            merged = efd_df.merge(
-                view_df[
-                    ["fixture_id", "home_team", "away_team", "start_time"]
-                ].drop_duplicates(),
-                on="fixture_id",
-                how="left",
-            )
-            display_cols = [
-                "EFD_score",
-                "league",
-                "market",
-                "selection",
-                "home_team",
-                "away_team",
-                "start_time",
-                "best_price",
-                "worst_price",
-                "books",
-            ]
-            st.dataframe(
-                merged[display_cols].sort_values("EFD_score", ascending=False).head(50),
-                use_container_width=True,
-            )
-
-# ------------------ ARBITRAGE ------------------ #
-
-with tab_arb:
-    if odds_all.empty:
-        st.info("No odds yet. Run a snapshot first.")
+    # Sportsbooks
+    books_choice = st.sidebar.multiselect(
+        "Sportsbooks",
+        options=["ALL"] + DEFAULT_SPORTBOOKS,
+        default=["ALL"],
+        help="Books to request from OpticOdds.",
+    )
+    if "ALL" in books_choice or not books_choice:
+        books_selected = DEFAULT_SPORTBOOKS
     else:
-        arb_df = detect_arbitrage(odds_all)
-        st.markdown("### 💰 Live Arbitrage Opportunities (across all ingested data)")
+        books_selected = books_choice
 
-        if arb_df.empty:
-            st.info("No pure arbitrage detected yet.")
-        else:
-            show_cols = [
-                "arb_yield_pct",
-                "league",
-                "market",
-                "fixture_id",
-                "num_outcomes",
-                "outcomes",
-            ]
-            st.dataframe(
-                arb_df[show_cols].head(100),
-                use_container_width=True,
-            )
-
-# ------------------ LINE MOVES ------------------ #
-
-with tab_moves:
-    if odds_all.empty:
-        st.info("No odds yet. Run a snapshot first.")
+    # Markets
+    markets_choice = st.sidebar.multiselect(
+        "Markets",
+        options=["ALL"] + DEFAULT_MARKETS,
+        default=["ALL"],
+        help="You can start with Moneyline only if you want it lean.",
+    )
+    if "ALL" in markets_choice or not markets_choice:
+        markets_selected = DEFAULT_MARKETS
     else:
-        moves_df = compute_line_moves(odds_all)
-        st.markdown("### 📈 Line Movement (open vs current – this session)")
+        markets_selected = markets_choice
 
-        if moves_df.empty:
-            st.info("No movement yet – pull multiple snapshots over time.")
+    max_per_sport = st.sidebar.slider(
+        "Max fixtures per sport (snapshot)",
+        min_value=5,
+        max_value=100,
+        value=40,
+        step=5,
+    )
+
+    st.sidebar.markdown("---")
+    run_snapshot = st.sidebar.button("🚀 Run Snapshot", use_container_width=True)
+
+    return {
+        "api_key": api_key,
+        "sports": sports_selected,
+        "sports_display": sports_choice,
+        "books": books_selected,
+        "markets": markets_selected,
+        "max_per_sport": max_per_sport,
+        "run_snapshot": run_snapshot,
+    }
+
+
+# =========================
+#  MAIN APP
+# =========================
+
+def main():
+    st.set_page_config(
+        page_title="EDGE FORCE Dominion – OpticOdds",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    init_session()
+
+    # Simple "neon dark" vibe using markdown + CSS
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background: radial-gradient(circle at top, #0b1535 0, #050810 45%, #000000 100%);
+            color: #f2f4ff;
+        }
+        .efd-card {
+            border-radius: 18px;
+            padding: 18px 22px;
+            background: linear-gradient(135deg,#0b1023,#050814);
+            border: 1px solid rgba(0,210,255,0.35);
+            box-shadow: 0 0 25px rgba(0,210,255,0.18);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="efd-card">
+          <h1>🏆 EDGE FORCE Dominion — OpticOdds Live Engine</h1>
+          <p>Multi-sport odds ingestion, EFD scoring, and arbitrage radar over your OpticOdds feed.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cfg = sidebar_controls()
+    api_key = cfg["api_key"]
+
+    if not api_key:
+        st.warning("Paste your OpticOdds API key in the sidebar to start.")
+        return
+
+    # Run snapshot when user clicks button
+    if cfg["run_snapshot"]:
+        with st.spinner("Pulling fixtures and odds snapshot from OpticOdds…"):
+            fixtures_df, odds_df = build_snapshot(
+                api_key=api_key,
+                sports=cfg["sports"],
+                sportsbooks=cfg["books"],
+                markets=cfg["markets"],
+                max_per_sport=cfg["max_per_sport"],
+            )
+            st.session_state[SESSION_KEY_FIXTURES] = fixtures_df
+            st.session_state[SESSION_KEY_SNAPSHOT] = odds_df
+
+    fixtures_df: pd.DataFrame = st.session_state[SESSION_KEY_FIXTURES]
+    odds_df: pd.DataFrame = st.session_state[SESSION_KEY_SNAPSHOT]
+
+    tabs = st.tabs(["🏠 Dashboard", "💰 Arbitrage", "📈 Line Moves", "📊 Analytics"])
+
+    # --------------- Dashboard ---------------
+    with tabs[0]:
+        st.subheader("Live Snapshot")
+
+        if odds_df.empty:
+            st.info("No odds data yet. Click **Run Snapshot** in the sidebar.")
         else:
+            # Small KPIs
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Active Sports (snapshot)", len(odds_df["sport_label"].unique()))
+            with col2:
+                st.metric("Tracked Sportsbooks", len(odds_df["sportsbook"].unique()))
+            with col3:
+                st.metric("Rows ingested", len(odds_df))
+
+            # Filters
+            colf1, colf2, colf3 = st.columns(3)
+            with colf1:
+                sport_filter = st.selectbox(
+                    "Filter by sport",
+                    options=["ALL"] + sorted(odds_df["sport_label"].unique().tolist()),
+                    index=0,
+                )
+            with colf2:
+                book_filter = st.selectbox(
+                    "Filter by book",
+                    options=["ALL"] + sorted(odds_df["sportsbook"].unique().tolist()),
+                    index=0,
+                )
+            with colf3:
+                market_filter = st.selectbox(
+                    "Filter by market",
+                    options=["ALL"] + sorted(odds_df["market"].unique().tolist()),
+                    index=0,
+                )
+
+            df_view = odds_df.copy()
+            if sport_filter != "ALL":
+                df_view = df_view[df_view["sport_label"] == sport_filter]
+            if book_filter != "ALL":
+                df_view = df_view[df_view["sportsbook"] == book_filter]
+            if market_filter != "ALL":
+                df_view = df_view[df_view["market"] == market_filter]
+
+            # Build matchup label
+            df_view["matchup"] = df_view["away_team"].fillna("") + " @ " + df_view[
+                "home_team"
+            ].fillna("")
+
+            st.markdown("### Snapshot Odds")
             st.dataframe(
-                moves_df[
+                df_view[
                     [
+                        "sport_label",
                         "league",
+                        "matchup",
+                        "commence_time",
+                        "sportsbook",
                         "market",
                         "selection",
-                        "sportsbook",
-                        "open_odds",
-                        "current_odds",
-                        "line_move",
-                        "direction",
+                        "price_american",
+                        "price_decimal",
                     ]
-                ].head(200),
+                ].sort_values(["sport_label", "commence_time"]),
                 use_container_width=True,
+                height=450,
             )
 
-# ------------------ ANALYTICS ------------------ #
-
-with tab_analytics:
-    st.markdown("### 📊 Session-level analytics")
-
-    if odds_all.empty:
-        st.info("No data yet.")
-    else:
-        # Simple summary by league & market
-        summary = (
-            odds_all.groupby(["league", "market"])
-            .agg(
-                num_rows=("fixture_id", "count"),
-                num_fixtures=("fixture_id", "nunique"),
-                num_books=("sportsbook", "nunique"),
+            # Game detail selector
+            st.markdown("---")
+            st.markdown("#### Game Detail")
+            unique_games = (
+                df_view.groupby("fixture_id")
+                .agg(
+                    matchup=("matchup", "first"),
+                    sport_label=("sport_label", "first"),
+                )
+                .reset_index()
             )
-            .reset_index()
-            .sort_values("num_rows", ascending=False)
-        )
-        st.dataframe(summary, use_container_width=True)
+            if not unique_games.empty:
+                fixture_ids_list = unique_games["fixture_id"].tolist()
+                labels = [
+                    f"{row['sport_label']} – {row['matchup']} ({row['fixture_id']})"
+                    for _, row in unique_games.iterrows()
+                ]
+                selected = st.selectbox(
+                    "Pick a matchup",
+                    options=["None"] + labels,
+                    index=0,
+                )
+                if selected != "None":
+                    sel_idx = labels.index(selected)
+                    sel_fixture_id = fixture_ids_list[sel_idx]
+                    gdf = df_view[df_view["fixture_id"] == sel_fixture_id].copy()
 
-        st.write("-----")
-        st.caption(
-            "This v1 is poll-based (snapshots). To get more movement/arbs, keep running "
-            "snapshots while games and markets are active."
+                    st.markdown(f"##### {selected}")
+                    st.dataframe(
+                        gdf[
+                            [
+                                "sportsbook",
+                                "market",
+                                "selection",
+                                "price_american",
+                                "price_decimal",
+                            ]
+                        ].sort_values(["market", "sportsbook"]),
+                        use_container_width=True,
+                    )
+
+    # --------------- Arbitrage ---------------
+    with tabs[1]:
+        st.subheader("Arbitrage Radar")
+
+        if odds_df.empty:
+            st.info("No odds snapshot yet.")
+        else:
+            arb_df = detect_arbitrage(odds_df)
+            if arb_df.empty:
+                st.info("No clear arbitrage edges detected in this snapshot.")
+            else:
+                st.dataframe(
+                    arb_df[
+                        [
+                            "sport_label",
+                            "matchup",
+                            "edge_percent",
+                            "legs",
+                        ]
+                    ],
+                    use_container_width=True,
+                    height=450,
+                )
+
+    # --------------- Line Moves (placeholder) ---------------
+    with tabs[2]:
+        st.subheader("Line Movement (Session)")
+
+        st.info(
+            "This v1 focuses on snapshot odds. "
+            "Next step is wiring the OpticOdds /stream/odds/{sport} endpoint "
+            "into this structure so we can track open vs current for each side."
         )
+
+    # --------------- Analytics ---------------
+    with tabs[3]:
+        st.subheader("EFD Scoring & Analytics")
+
+        if odds_df.empty:
+            st.info("No odds snapshot yet.")
+        else:
+            efd_df = compute_efd_scores(odds_df)
+            if efd_df.empty:
+                st.info("No EFD scores yet (check that moneyline data is present).")
+            else:
+                st.markdown("### Top EFD Edges (Moneyline Only)")
+                efd_df["matchup"] = (
+                    efd_df["away_team"].fillna("") + " @ " + efd_df["home_team"].fillna("")
+                )
+                st.dataframe(
+                    efd_df[
+                        [
+                            "sport_label",
+                            "matchup",
+                            "selection",
+                            "EFD_score",
+                            "best_price",
+                            "avg_price",
+                            "implied_prob",
+                            "ev_edge",
+                            "dispersion",
+                        ]
+                    ].sort_values("EFD_score", ascending=False),
+                    use_container_width=True,
+                    height=450,
+                )
+
+
+if __name__ == "__main__":
+    main()
