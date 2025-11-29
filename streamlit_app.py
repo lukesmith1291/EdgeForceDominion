@@ -1,5 +1,4 @@
 import os
-import time
 from typing import List, Dict, Any
 
 import requests
@@ -31,7 +30,7 @@ DEFAULT_SPORTSBOOKS = [
     "LowVig",
 ]
 
-# OpticOdds market names (can be name OR id). These are the core ones.
+# Core markets (OpticOdds names/ids)
 DEFAULT_MARKETS = [
     "moneyline",
     "point_spread",
@@ -46,7 +45,6 @@ DEFAULT_MARKETS = [
 def get_active_fixtures(api_key: str, sport: str, league: str) -> pd.DataFrame:
     """
     Pull active fixtures for a given sport/league using /fixtures/active.
-    We keep it simple: no date filters, just what OpticOdds marks as active.
     """
     params = {
         "key": api_key,
@@ -164,8 +162,7 @@ def compute_efd_scores(odds_df: pd.DataFrame) -> pd.DataFrame:
       - volatility of prices
       - spread between best and worst price
 
-    This is where you plug in your REAL Edge Force Dominion formula later.
-    Right now it just gives you a 0–100 style score with decent behavior.
+    Placeholder heuristic until you plug in the real EFD formula.
     """
     if odds_df.empty:
         return pd.DataFrame()
@@ -219,7 +216,14 @@ def compute_efd_scores(odds_df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    return pd.DataFrame(scored_rows).sort_values("EFD_score", ascending=False)
+    if not scored_rows:
+        return pd.DataFrame()
+
+    df_scored = pd.DataFrame(scored_rows)
+    if "EFD_score" not in df_scored.columns:
+        return df_scored
+
+    return df_scored.sort_values("EFD_score", ascending=False)
 
 
 def find_arbitrage(odds_df: pd.DataFrame) -> pd.DataFrame:
@@ -344,7 +348,7 @@ def apply_neon_theme():
 
 def main():
     st.set_page_config(
-        page_title="Edge Force Dominion – Live Odds Command",
+        page_title="Edge Force Dominion – Live Odds Board",
         layout="wide",
     )
     apply_neon_theme()
@@ -360,32 +364,29 @@ def main():
         help="You can also set OPTICODDS_API_KEY as an env var.",
     )
 
-    selected_sports = st.sidebar.multiselect(
+    # Sports with ALL option
+    sport_options = ["ALL"] + list(SPORT_LEAGUE_MAP.keys())
+    selected_sports_raw = st.sidebar.multiselect(
         "Sports",
-        list(SPORT_LEAGUE_MAP.keys()),
-        default=["NBA", "NFL"],
+        sport_options,
+        default=["ALL"],
     )
 
-    selected_books = st.sidebar.multiselect(
+    # Sportsbooks with ALL option
+    book_options = ["ALL"] + DEFAULT_SPORTSBOOKS
+    selected_books_raw = st.sidebar.multiselect(
         "Sportsbooks (max 5 per request)",
-        DEFAULT_SPORTSBOOKS,
-        default=DEFAULT_SPORTSBOOKS[:4],
+        book_options,
+        default=["ALL"],
     )
 
-    selected_markets = st.sidebar.multiselect(
+    # Markets with ALL option
+    market_options_friendly = ["ALL", "Moneyline", "Point Spread", "Total Points"]
+    selected_markets_friendly_raw = st.sidebar.multiselect(
         "Markets",
-        ["Moneyline", "Point Spread", "Total Points"],
-        default=["Moneyline", "Point Spread", "Total Points"],
+        market_options_friendly,
+        default=["ALL"],
     )
-
-    market_ids: List[str] = []
-    for m in selected_markets:
-        if m == "Moneyline":
-            market_ids.append("moneyline")
-        elif m == "Point Spread":
-            market_ids.append("point_spread")
-        elif m == "Total Points":
-            market_ids.append("total_points")
 
     max_fixtures_per_sport = st.sidebar.slider(
         "Max fixtures per sport",
@@ -397,6 +398,32 @@ def main():
 
     run_scan = st.sidebar.button("🚀 Pull live snapshot")
 
+    # ---------- Resolve ALL selections ----------
+    # Sports
+    if "ALL" in selected_sports_raw or not selected_sports_raw:
+        selected_sports = list(SPORT_LEAGUE_MAP.keys())
+    else:
+        selected_sports = [s for s in selected_sports_raw if s in SPORT_LEAGUE_MAP]
+
+    # Sportsbooks
+    if "ALL" in selected_books_raw or not selected_books_raw:
+        selected_books = list(DEFAULT_SPORTSBOOKS)
+    else:
+        selected_books = [b for b in selected_books_raw if b in DEFAULT_SPORTSBOOKS]
+
+    # Markets → actual OpticOdds IDs
+    if "ALL" in selected_markets_friendly_raw or not selected_markets_friendly_raw:
+        market_ids = ["moneyline", "point_spread", "total_points"]
+    else:
+        market_ids: List[str] = []
+        for m in selected_markets_friendly_raw:
+            if m == "Moneyline":
+                market_ids.append("moneyline")
+            elif m == "Point Spread":
+                market_ids.append("point_spread")
+            elif m == "Total Points":
+                market_ids.append("total_points")
+
     # ---------- HEADER ----------
     st.markdown(
         """
@@ -404,9 +431,9 @@ def main():
           <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;">
             <div>
               <div class="efd-pill">Edge Force Dominion • Live Board</div>
-              <h1 style="margin:0.3rem 0 0.4rem 0;">Neon Command Center</h1>
+              <h1 style="margin:0.3rem 0 0.4rem 0;">Live Odds & Arbitrage Console</h1>
               <p style="margin:0;color:#bfdbfe;font-size:0.9rem;">
-                Ranked matchups by EFD score, live odds snapshots, and cross-sport arbitrage radar – all in one pane.
+                Ranked matchups by EFD score, odds snapshots per game, and a cross-sport arbitrage radar.
               </p>
             </div>
           </div>
@@ -425,15 +452,15 @@ def main():
         return
 
     if not selected_sports:
-        st.warning("Select at least one sport.")
+        st.warning("No sports selected after resolving ALL. Check your sports filter.")
         return
 
     if not selected_books:
-        st.warning("Select at least one sportsbook.")
+        st.warning("No sportsbooks selected after resolving ALL. Check your sportsbook filter.")
         return
 
     if not market_ids:
-        st.warning("Select at least one market.")
+        st.warning("No markets selected after resolving ALL. Check your market filter.")
         return
 
     # ---------- PULL DATA ----------
@@ -472,7 +499,7 @@ def main():
         all_odds_frames.append(odds_df)
 
     if not all_odds_frames:
-        st.warning("No odds data came back. Check that your key, sports, books and markets are valid.")
+        st.warning("No odds data came back. Check that your key, sports, books, and markets are valid.")
         return
 
     odds_all = pd.concat(all_odds_frames, ignore_index=True)
@@ -517,7 +544,7 @@ def main():
             st.subheader(f"{s_key} – Edge Force Dominion Board")
 
             league_name = SPORT_LEAGUE_MAP[s_key]["league"]
-            sport_efd = efd_df[efd_df["league"] == league_name]
+            sport_efd = efd_df[efd_df["league"] == league_name] if not efd_df.empty else pd.DataFrame()
 
             if sport_efd.empty:
                 st.info("No EFD-ranked matchups for this sport in the current snapshot.")
@@ -593,4 +620,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
