@@ -16,16 +16,15 @@ st.set_page_config(
 
 OPTICODDS_API_BASE = "https://api.opticodds.com/api/v3"
 
-# UI tab label -> OpticOdds sport + league
-# IMPORTANT: leagues are lower-case as required by OpticOdds.
-SPORT_MAP = {
-    "🏀 NBA":   {"sport": "basketball", "leagues": ["nba"]},
-    "🏀 NCAAB": {"sport": "basketball", "leagues": ["ncaab"]},
-    "🏈 NFL":   {"sport": "football",   "leagues": ["nfl"]},
-    "🏈 NCAAF": {"sport": "football",   "leagues": ["ncaaf"]},
-    "🏒 NHL":   {"sport": "hockey",     "leagues": ["nhl"]},
-    "⚾ MLB":   {"sport": "baseball",   "leagues": ["mlb"]},
-    "⚽ Soccer": {"sport": "soccer",    "leagues": []},  # pass sport only
+# UI tab label -> OpticOdds league code
+# (Use the exact league strings OpticOdds expects)
+LEAGUE_MAP = {
+    "🏀 NBA":   "NBA",
+    "🏀 NCAAB": "NCAAB",
+    "🏈 NFL":   "NFL",
+    "🏈 NCAAF": "NCAAF",
+    "🏒 NHL":   "NHL",
+    "⚾ MLB":   "MLB",
 }
 
 # ============================================================
@@ -114,23 +113,19 @@ def parse_sse_stream(
 
 def stream_odds_once(
     api_key: str,
-    sport: str,
-    leagues: List[str],
+    league: str,
     sportsbooks: List[str],
     markets: List[str],
     is_live: str,
     max_events: int = 150,
 ) -> pd.DataFrame:
     """
-    Hit /stream/odds once, obeying rule:
-        "You must provide exactly ONE of sport, league, or fixture_id."
-    We use:
-        - league[0] when a league exists
-        - sport when there is no league configured
-    Then aggregate each (fixture, sportsbook, market, selection)
-    to open_odds, current_odds, and line_move.
+    Hit /stream/odds once using *league only*,
+    obeying rule: exactly ONE of sport, league, or fixture_id.
 
-    Returns a DataFrame with columns:
+    We ALWAYS send league (NBA, NFL, etc) and NEVER send sport or fixture_id.
+
+    Returns a DataFrame with:
         fixture_id, sportsbook, market, selection,
         league, sport, open_odds, current_odds,
         line_move, move_abs, move_direction
@@ -141,19 +136,12 @@ def stream_odds_once(
 
     url = f"{OPTICODDS_API_BASE}/stream/odds"
 
-    # Build params obeying "exactly one" rule
     params: Dict[str, Any] = {
         "key": api_key,
+        "league": league,                     # ✅ EXACTLY ONE selector
         "sportsbook": sportsbooks or [],
         "market": markets or ["Moneyline"],
     }
-
-    if leagues:
-        # Use exactly ONE league string
-        params["league"] = leagues[0]
-    else:
-        # No league configured (e.g. generic soccer) → use sport instead
-        params["sport"] = sport
 
     if is_live in ("true", "false"):
         params["is_live"] = is_live
@@ -166,7 +154,6 @@ def stream_odds_once(
         msg = f"OpticOdds: {e}"
         if hasattr(e, "response") and e.response is not None:
             try:
-                # show JSON error message if available
                 err = e.response.text
                 msg = f"OpticOdds: HTTP {e.response.status_code}: {err}"
             except Exception:
@@ -353,7 +340,7 @@ books = books[:5]  # OpticOdds limit per request
 min_move = st.sidebar.slider("Min line move (cents)", 5, 100, 20)
 min_arb_edge = st.sidebar.slider("Min arb edge (%)", 0.1, 5.0, 0.5)
 burst_events = st.sidebar.slider(
-    "Events per refresh (per sport)", 40, 400, 160, step=40
+    "Events per refresh (per league)", 40, 400, 160, step=40
 )
 
 live_filter = st.sidebar.selectbox(
@@ -381,7 +368,7 @@ st.markdown(
 <div class="efd-card">
   <h1 style="margin-bottom:0.25rem;">🏆 Edge Force Dominion — Live OpticOdds Stream</h1>
   <p style="opacity:0.9;margin-bottom:0;">
-    Direct from <code>/stream/odds</code> using live SSE. No fake rows, no demos.
+    Direct from <code>/stream/odds?league=...</code> using live SSE for each US league tab.
   </p>
 </div>
 """,
@@ -398,16 +385,14 @@ else:
 st.markdown("---")
 
 # ============================================================
-#  TABS PER SPORT
+#  TABS PER LEAGUE
 # ============================================================
 
-tabs = st.tabs(list(SPORT_MAP.keys()))
+tabs = st.tabs(list(LEAGUE_MAP.keys()))
 
-for tab_label, tab in zip(SPORT_MAP.keys(), tabs):
+for tab_label, tab in zip(LEAGUE_MAP.keys(), tabs):
     with tab:
-        cfg = SPORT_MAP[tab_label]
-        sport = cfg["sport"]
-        leagues = cfg["leagues"]
+        league_code = LEAGUE_MAP[tab_label]
 
         st.markdown(f"### {tab_label} — {mode}")
 
@@ -417,8 +402,7 @@ for tab_label, tab in zip(SPORT_MAP.keys(), tabs):
 
         df = stream_odds_once(
             api_key=active_key,
-            sport=sport,
-            leagues=leagues,
+            league=league_code,
             sportsbooks=books,
             markets=["Moneyline"],
             is_live=is_live,
@@ -426,7 +410,7 @@ for tab_label, tab in zip(SPORT_MAP.keys(), tabs):
         )
 
         if df.empty:
-            st.info("No odds came through in this burst (for this sport / filters).")
+            st.info("No odds came through in this burst (for this league / filters).")
             continue
 
         if mode.startswith("🔥"):
