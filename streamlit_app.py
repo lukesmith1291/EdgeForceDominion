@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 # ============================================================
-#  CONFIG
+#  STREAMLIT CONFIG
 # ============================================================
 st.set_page_config(
     page_title="Edge Force Dominion – Live OpticOdds Stream",
@@ -16,15 +16,16 @@ st.set_page_config(
 
 OPTICODDS_API_BASE = "https://api.opticodds.com/api/v3"
 
-# Mapping: UI tab label -> API sport + leagues
+# UI tab label -> OpticOdds sport + league
+# IMPORTANT: leagues are lower-case as required by OpticOdds.
 SPORT_MAP = {
     "🏀 NBA":   {"sport": "basketball", "leagues": ["nba"]},
     "🏀 NCAAB": {"sport": "basketball", "leagues": ["ncaab"]},
-    "🏈 NFL":   {"sport": "football",  "leagues": ["nfl"]},
-    "🏈 NCAAF": {"sport": "football",  "leagues": ["ncaaf"]},
-    "🏒 NHL":   {"sport": "hockey",    "leagues": ["nhl"]},
-    "⚾ MLB":   {"sport": "baseball",  "leagues": ["mlb"]},
-    "⚽ Soccer": {"sport": "soccer",   "leagues": []},
+    "🏈 NFL":   {"sport": "football",   "leagues": ["nfl"]},
+    "🏈 NCAAF": {"sport": "football",   "leagues": ["ncaaf"]},
+    "🏒 NHL":   {"sport": "hockey",     "leagues": ["nhl"]},
+    "⚾ MLB":   {"sport": "baseball",   "leagues": ["mlb"]},
+    "⚽ Soccer": {"sport": "soccer",    "leagues": []},  # pass sport only
 }
 
 # ============================================================
@@ -65,6 +66,7 @@ section.main {
 # ============================================================
 
 def american_to_decimal(odds: float) -> float:
+    """Convert American odds to decimal odds."""
     try:
         o = float(odds)
     except Exception:
@@ -78,7 +80,8 @@ def parse_sse_stream(
     max_seconds: int = 8,
 ) -> List[Tuple[str, str]]:
     """
-    Minimal SSE parser – returns list of (event_name, data_json_str).
+    Very small SSE parser.
+    Returns list of (event_name, data_json_string).
     """
     events: List[Tuple[str, str]] = []
     event_name = None
@@ -92,6 +95,7 @@ def parse_sse_stream(
             continue
         line = raw.strip()
         if not line:
+            # dispatch current event
             if event_name and data_lines:
                 events.append((event_name, "\n".join(data_lines)))
                 if len(events) >= max_events:
@@ -99,6 +103,7 @@ def parse_sse_stream(
             event_name = None
             data_lines = []
             continue
+
         if line.startswith("event:"):
             event_name = line[len("event:") :].strip()
         elif line.startswith("data:"):
@@ -117,30 +122,56 @@ def stream_odds_once(
     max_events: int = 150,
 ) -> pd.DataFrame:
     """
-    Hit /stream/odds/{sport} once, collect a burst, and build
-    open/current odds + line movement per (fixture, book, side).
+    Hit /stream/odds once, obeying rule:
+        "You must provide exactly ONE of sport, league, or fixture_id."
+    We use:
+        - league[0] when a league exists
+        - sport when there is no league configured
+    Then aggregate each (fixture, sportsbook, market, selection)
+    to open_odds, current_odds, and line_move.
+
+    Returns a DataFrame with columns:
+        fixture_id, sportsbook, market, selection,
+        league, sport, open_odds, current_odds,
+        line_move, move_abs, move_direction
     """
     if not api_key:
+        st.error("No OpticOdds API key set. Paste it in the sidebar and press 'Test & Use Key'.")
         return pd.DataFrame()
 
-    # April 2025 change: /stream/<sport>/odds -> /stream/odds/<sport>
-    url = f"{OPTICODDS_API_BASE}/stream/odds/{sport}"
+    url = f"{OPTICODDS_API_BASE}/stream/odds"
 
+    # Build params obeying "exactly one" rule
     params: Dict[str, Any] = {
         "key": api_key,
         "sportsbook": sportsbooks or [],
         "market": markets or ["Moneyline"],
     }
+
     if leagues:
-        params["league"] = leagues
+        # Use exactly ONE league string
+        params["league"] = leagues[0]
+    else:
+        # No league configured (e.g. generic soccer) → use sport instead
+        params["sport"] = sport
+
     if is_live in ("true", "false"):
         params["is_live"] = is_live
 
-    resp = None
+    resp: requests.Response | None = None
     try:
         resp = requests.get(url, params=params, stream=True, timeout=20)
         resp.raise_for_status()
-    except Exception:
+    except Exception as e:
+        msg = f"OpticOdds: {e}"
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                # show JSON error message if available
+                err = e.response.text
+                msg = f"OpticOdds: HTTP {e.response.status_code}: {err}"
+            except Exception:
+                pass
+        st.error(msg)
         if resp is not None:
             resp.close()
         return pd.DataFrame()
@@ -218,8 +249,10 @@ def stream_odds_once(
 
 def detect_arbitrage(df: pd.DataFrame, min_edge_pct: float) -> pd.DataFrame:
     """
-    Simple two-way arb finder on the latest prices in df.
-    Assumes df has current_odds for each (fixture, selection, sportsbook).
+    Simple 2-way arbitrage finder.
+    For each fixture + market:
+        - take best price on each selection across sportsbooks
+        - if 1/d1 + 1/d2 < 1 → arbitrage exists
     """
     if df.empty:
         return df
@@ -228,7 +261,7 @@ def detect_arbitrage(df: pd.DataFrame, min_edge_pct: float) -> pd.DataFrame:
     grouped = df.groupby(["fixture_id", "market"])
 
     for (fixture_id, market), grp in grouped:
-        # Best price per selection
+        # best price per side
         best = (
             grp.sort_values("current_odds", ascending=False)
             .groupby("selection")
@@ -272,11 +305,12 @@ def detect_arbitrage(df: pd.DataFrame, min_edge_pct: float) -> pd.DataFrame:
 
 def test_key_once(api_key: str) -> Tuple[bool, str]:
     """
-    Quick smoke test using /sportsbooks/active so we don't depend on stream
-    for auth check. If this passes, the key is valid and we can open streams.
+    Cheap smoke test: hit /sportsbooks/active with ?key=.
+    If this passes, the key is valid.
     """
     if not api_key:
         return False, "No key provided."
+
     try:
         url = f"{OPTICODDS_API_BASE}/sportsbooks/active"
         resp = requests.get(url, params={"key": api_key}, timeout=10)
@@ -314,11 +348,13 @@ books_raw = st.sidebar.text_input(
     "FanDuel,DraftKings,BetMGM,Caesars,LowVig",
 )
 books = [b.strip() for b in books_raw.split(",") if b.strip()]
-books = books[:5]  # API limit
+books = books[:5]  # OpticOdds limit per request
 
 min_move = st.sidebar.slider("Min line move (cents)", 5, 100, 20)
 min_arb_edge = st.sidebar.slider("Min arb edge (%)", 0.1, 5.0, 0.5)
-burst_events = st.sidebar.slider("Events per refresh (per sport)", 40, 400, 160, step=40)
+burst_events = st.sidebar.slider(
+    "Events per refresh (per sport)", 40, 400, 160, step=40
+)
 
 live_filter = st.sidebar.selectbox(
     "Odds type",
@@ -331,7 +367,6 @@ elif live_filter == "Live only":
 else:
     is_live = ""
 
-# Manual refresh button – just reruns script
 if st.sidebar.button("🔄 Pull fresh stream burst"):
     st.rerun()
 
@@ -346,7 +381,7 @@ st.markdown(
 <div class="efd-card">
   <h1 style="margin-bottom:0.25rem;">🏆 Edge Force Dominion — Live OpticOdds Stream</h1>
   <p style="opacity:0.9;margin-bottom:0;">
-    Direct from <code>/stream/odds/&lt;sport&gt;</code>. Live odds only – no fake rows, no demos.
+    Direct from <code>/stream/odds</code> using live SSE. No fake rows, no demos.
   </p>
 </div>
 """,
@@ -394,7 +429,7 @@ for tab_label, tab in zip(SPORT_MAP.keys(), tabs):
             st.info("No odds came through in this burst (for this sport / filters).")
             continue
 
-        if mode.startswith("🔥"):  # steam view
+        if mode.startswith("🔥"):
             steam_df = df[df["move_abs"] >= min_move]
             if steam_df.empty:
                 st.success("No steam above your threshold in this burst.")
