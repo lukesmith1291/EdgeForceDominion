@@ -2,6 +2,4 @@ streamlit==1.32.0
 pandas==2.2.1
 numpy==1.26.4
 requests==2.31.0
-python-dateutil==2.8.2
-pytz==2024.1
 streamlit-autorefresh==1.0.1
