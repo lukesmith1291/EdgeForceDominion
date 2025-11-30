@@ -1,85 +1,122 @@
 # streamlit_app.py
-# EDGE FORCE DOMINION – OpticOdds v3 Global Odds Engine
+# EDGE FORCE DOMINION — OpticOdds v3 Dashboard
+# Snapshot + refresh based live board with EV / EFD / arbitrage.
 
-import os, json, threading, queue, time, requests, sseclient
+import os
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ------------------------------------------------------------------
-# 🔑 CONFIG
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# GLOBAL CONFIG
+# -----------------------------------------------------------
+
 OPTICODDS_BASE = "https://api.opticodds.com/api/v3"
 
-SPORTS_CONFIG = {
-    "nba":   {"sport": "basketball", "league": "nba"},
-    "ncaab": {"sport": "basketball", "league": "ncaab"},
-    "nfl":   {"sport": "football",   "league": "nfl"},
-    "ncaaf": {"sport": "football",   "league": "ncaaf"},
-    "mlb":   {"sport": "baseball",   "league": "mlb"},
-    "nhl":   {"sport": "ice_hockey", "league": "nhl"},
+# app alias -> (sport id, league id) per OpticOdds docs
+SPORTS_CONFIG: Dict[str, Dict[str, str]] = {
+    "NBA":   {"sport": "basketball", "league": "nba"},
+    "NCAAB": {"sport": "basketball", "league": "ncaab"},
+    "NFL":   {"sport": "football",   "league": "nfl"},
+    "NCAAF": {"sport": "football",   "league": "ncaaf"},
+    "MLB":   {"sport": "baseball",   "league": "mlb"},
+    "NHL":   {"sport": "ice_hockey", "league": "nhl"},
 }
 
-CORE_MARKETS      = ["moneyline", "spread", "total_points"]
-DEFAULT_BOOKS     = ["DraftKings", "FanDuel", "Caesars", "BetMGM"]
-MAX_FIXTURES_CALL = 5           # max fixture_ids per /fixtures/odds call
-SPORT_DELAY       = 1.0         # delay between sports on boot
-CHUNK_DELAY       = 0.5         # delay between odds chunks
+CORE_MARKETS = ["moneyline", "spread", "total_points"]
+DEFAULT_BOOKS = ["DraftKings", "FanDuel", "Caesars", "BetMGM", "Pinnacle", "LowVig"]
 
-# ------------------------------------------------------------------
-# 🔐 API-KEY HANDLER
-# ------------------------------------------------------------------
-def get_api_key() -> str:
-    try:  # Streamlit Cloud secret
-        return st.secrets["opticodds"]["api_key"]
-    except Exception:
-        return os.getenv("OPTICODDS_API_KEY", st.session_state.get("api_key", ""))
+MAX_FIXTURES_PER_CHUNK = 10          # to keep URLs sane
+SNAPSHOT_LOOKAHEAD_DAYS = 2          # how far ahead to pull fixtures
 
-# ------------------------------------------------------------------
-# 🎨 THEME
-# ------------------------------------------------------------------
-def inject_theme():
+# -----------------------------------------------------------
+# THEME
+# -----------------------------------------------------------
+
+def inject_theme() -> None:
     st.markdown(
         """
         <style>
-        .stApp{
-          background:radial-gradient(circle at top left,#020617 0,#000 40%,#020617 100%);
-          color:#e2f3ff
+        .stApp {
+            background: radial-gradient(circle at top left,#020617 0,#000 45%,#020617 100%);
+            color: #e2f3ff;
         }
-        h1,h2,h3{
-          color:#e5f0ff;
-          text-shadow:0 0 12px rgba(96,165,250,.85)
+        h1, h2, h3 {
+            color: #e5f0ff;
+            text-shadow: 0 0 12px rgba(96,165,250,.85);
         }
-        .fixture-card{
-          border-radius:16px;
-          padding:12px 14px;
-          background:linear-gradient(135deg,rgba(15,118,110,.15),rgba(59,130,246,.1));
-          border:1px solid rgba(148,163,184,.5);
-          box-shadow:0 0 18px rgba(56,189,248,.25)
+        .fixture-card {
+            border-radius: 16px;
+            padding: 10px 14px;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg,
+                        rgba(15,118,110,.16),
+                        rgba(59,130,246,.12));
+            border: 1px solid rgba(148,163,184,.6);
+            box-shadow: 0 0 20px rgba(56,189,248,.25);
         }
-        .fixture-header{
-          font-size:.9rem;
-          text-transform:uppercase;
-          letter-spacing:.08em;
-          color:#a5b4fc;
-          margin-bottom:4px
+        .fixture-header {
+            font-size: .8rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: #a5b4fc;
+            margin-bottom: 4px;
         }
-        .team-name{font-weight:600}
-        .odds-row{font-size:.85rem;color:#e2e8f0}
-        .cmd-user{color:#93c5fd}
-        .cmd-system{color:#a5b4fc}
+        .team-name {
+            font-weight: 600;
+            font-size: .92rem;
+        }
+        .odds-row {
+            font-size: .84rem;
+            color: #e2e8f0;
+        }
+        .efd-pill {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: .75rem;
+            font-weight: 600;
+            background: radial-gradient(circle, #22c55e 0, #16a34a 60%, #166534 100%);
+            color: #ecfdf5;
+            box-shadow: 0 0 10px rgba(34,197,94,.7);
+            margin-left: 6px;
+        }
+        .metric-label {
+            font-size: .75rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: #94a3b8;
+        }
+        .metric-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-# ------------------------------------------------------------------
-# 🧮 MATH HELPERS
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# API KEY
+# -----------------------------------------------------------
+
+def get_api_key() -> str:
+    # Streamlit secrets → env → session_state
+    try:
+        return st.secrets["opticodds"]["api_key"]
+    except Exception:
+        return os.getenv("OPTICODDS_API_KEY", st.session_state.get("api_key", ""))
+
+# -----------------------------------------------------------
+# MATH HELPERS
+# -----------------------------------------------------------
+
 def american_to_decimal(odds: float) -> float:
     try:
         o = float(odds)
@@ -87,12 +124,16 @@ def american_to_decimal(odds: float) -> float:
         return 1.0
     if o == 0:
         return 1.0
-    return 1 + o / 100 if o > 0 else 1 + 100 / abs(o)
+    if o > 0:
+        return 1.0 + (o / 100.0)
+    return 1.0 + (100.0 / abs(o))
 
 
 def implied_prob(odds: float) -> float:
     dec = american_to_decimal(odds)
-    return 1 / dec if dec > 1 else 0.0
+    if dec <= 1:
+        return 0.0
+    return 1.0 / dec
 
 
 def minutes_until(iso: Optional[str]) -> Optional[float]:
@@ -100,112 +141,110 @@ def minutes_until(iso: Optional[str]) -> Optional[float]:
         return None
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return (dt - datetime.now(timezone.utc)).total_seconds() / 60
+        return (dt - datetime.now(timezone.utc)).total_seconds() / 60.0
     except Exception:
         return None
 
-# ------------------------------------------------------------------
-# 🔐 SESSION STATE
-# ------------------------------------------------------------------
-def init_state():
+# -----------------------------------------------------------
+# SESSION STATE INIT
+# -----------------------------------------------------------
+
+def init_state() -> None:
     defaults = dict(
         boot_done=False,
         boot_log=[],
-        board_df=pd.DataFrame(),   # current odds board
-        history_df=pd.DataFrame(), # SSE history (for line moves)
-        messages=[],
+        open_board_df=pd.DataFrame(),   # opening snapshot for steam
+        board_df=pd.DataFrame(),        # current snapshot
         sportsbooks=DEFAULT_BOOKS.copy(),
         api_key=get_api_key(),
-        sse_queue=queue.Queue(),
-        sse_running=False,
-        sse_thread=None,
-        last_update=None,
-        current_sport="nba",
+        last_snapshot_ts=None,
+        snapshot_run_id=0,              # bumps to force cache miss
     )
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
 
-def log_boot(msg: str):
+def log_boot(msg: str) -> None:
     st.session_state["boot_log"].append(msg)
 
-# ------------------------------------------------------------------
-# 🌐 OPTICODDS HELPERS (SNAPSHOT)
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# OPTIC ODDS HTTP
+# -----------------------------------------------------------
+
 def optic_get(path: str, params: Dict) -> Dict:
     params = dict(params)
     key = st.session_state["api_key"]
     if not key:
-        raise ValueError("❌ No OpticOdds API key configured.")
+        raise ValueError("No OpticOdds API key configured.")
     params["key"] = key
     url = f"{OPTICODDS_BASE}{path}"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def fetch_fixtures(sport_id: str, league_id: str, days: int = 2) -> pd.DataFrame:
+def fetch_fixtures_for_sport(sport_id: str, league_id: str) -> pd.DataFrame:
     """
-    Pull active fixtures for a sport/league in the next N days.
-    Uses /fixtures/active which you already had working.
+    Hit /fixtures/active for a single sport/league, in the next N days.
     """
     now = datetime.now(timezone.utc)
-    before = now + timedelta(days=days)
+    end = now + timedelta(days=SNAPSHOT_LOOKAHEAD_DAYS)
     try:
-        resp = optic_get(
+        data = optic_get(
             "/fixtures/active",
             {
                 "sport": sport_id,
                 "league": league_id,
                 "start_date_after": now.isoformat().replace("+00:00", "Z"),
-                "start_date_before": before.isoformat().replace("+00:00", "Z"),
+                "start_date_before": end.isoformat().replace("+00:00", "Z"),
             },
         )
-    except ValueError as e:
-        st.error(str(e))
+    except Exception as e:
+        log_boot(f"{sport_id}/{league_id} fixture error: {e}")
         return pd.DataFrame()
 
-    rows = []
-    for fx in resp.get("data", []):
+    rows: List[Dict] = []
+    for fx in data.get("data", []):
         try:
             rows.append(
                 {
                     "fixture_id": fx["id"],
-                    "sport": fx["sport"]["id"],
-                    "league": fx["league"]["id"],
+                    "sport": fx.get("sport", {}).get("id"),
+                    "league": fx.get("league", {}).get("id"),
                     "start_date": fx.get("start_date"),
+                    "status": fx.get("status"),
                     "home_name": fx.get("home_team_display"),
                     "away_name": fx.get("away_team_display"),
                     "home_logo": (fx.get("home_competitors") or [{}])[0].get("logo"),
                     "away_logo": (fx.get("away_competitors") or [{}])[0].get("logo"),
-                    "status": fx.get("status"),
                 }
             )
         except Exception as e:
-            log_boot(f"Bad fixture {fx.get('id')}: {e}")
+            log_boot(f"Bad fixture row: {e}")
     return pd.DataFrame(rows)
 
 
-def fetch_odds_chunks(
+def fetch_odds_for_fixtures(
     fixture_ids: List[str],
     markets: List[str],
     books: List[str],
-    status_placeholder,
 ) -> pd.DataFrame:
     """
-    Chunked /fixtures/odds calls for a list of fixture_ids.
+    Hit /fixtures/odds in chunks for a list of fixture_ids.
     """
     if not fixture_ids:
         return pd.DataFrame()
 
-    rows = []
-    total = (len(fixture_ids) + MAX_FIXTURES_CALL - 1) // MAX_FIXTURES_CALL
+    rows: List[Dict] = []
+    total_chunks = (len(fixture_ids) + MAX_FIXTURES_PER_CHUNK - 1) // MAX_FIXTURES_PER_CHUNK
 
-    for idx, i in enumerate(range(0, len(fixture_ids), MAX_FIXTURES_CALL), 1):
-        chunk = fixture_ids[i : i + MAX_FIXTURES_CALL]
-        status_placeholder.text(f"📡 Odds chunk {idx}/{total}")
+    progress = st.empty()
+
+    for chunk_index, pos in enumerate(range(0, len(fixture_ids), MAX_FIXTURES_PER_CHUNK), start=1):
+        chunk = fixture_ids[pos : pos + MAX_FIXTURES_PER_CHUNK]
+        progress.text(f"Pulling odds chunk {chunk_index}/{total_chunks}…")
         try:
-            resp = optic_get(
+            data = optic_get(
                 "/fixtures/odds",
                 {
                     "fixture_id": chunk,
@@ -214,22 +253,26 @@ def fetch_odds_chunks(
                     "odds_format": "AMERICAN",
                 },
             )
+        except Exception as e:
+            log_boot(f"Odds chunk error: {e}")
+            continue
 
-            for fx in resp.get("data", []):
-                fid = fx["id"]
-                sd = fx.get("start_date")
-                hname = fx.get("home_team_display")
-                aname = fx.get("away_team_display")
-                sport = fx.get("sport", {}).get("id")
-                league = fx.get("league", {}).get("id")
+        for fx in data.get("data", []):
+            fid = fx["id"]
+            sport = fx.get("sport", {}).get("id")
+            league = fx.get("league", {}).get("id")
+            start_date = fx.get("start_date")
+            hname = fx.get("home_team_display")
+            aname = fx.get("away_team_display")
 
-                for od in fx.get("odds", []):
+            for od in fx.get("odds", []):
+                try:
                     rows.append(
                         {
                             "fixture_id": fid,
                             "sport": sport,
                             "league": league,
-                            "start_date": sd,
+                            "start_date": start_date,
                             "home_name": hname,
                             "away_name": aname,
                             "sportsbook": od.get("sportsbook"),
@@ -242,565 +285,430 @@ def fetch_odds_chunks(
                             "points": od.get("points"),
                         }
                     )
+                except Exception as e:
+                    log_boot(f"Bad odds row: {e}")
 
-            if i + MAX_FIXTURES_CALL < len(fixture_ids):
-                time.sleep(CHUNK_DELAY)
+        time.sleep(0.3)
 
-        except Exception as e:
-            log_boot(f"Chunk {idx} error: {e}")
-
+    progress.empty()
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
     df["price_decimal"] = df["price"].apply(american_to_decimal)
     df["implied_prob"] = df["price"].apply(implied_prob)
-    df["open_price"] = df["price"]
-    df["open_implied"] = df["implied_prob"]
-    df["timestamp"] = datetime.utcnow().isoformat()
     return df
 
-# ------------------------------------------------------------------
-# 🧮 EV + EFD SCORING
-# ------------------------------------------------------------------
-def efd_row(row) -> float:
-    ev = float(row.get("no_vig_ev") or 0)
-    open_i = float(row.get("open_implied") or 0)
-    curr_i = float(row.get("curr_implied") or 0)
+# -----------------------------------------------------------
+# EV + EFD
+# -----------------------------------------------------------
+
+def compute_no_vig_ev(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each fixture/market/grouping, find best odds per selection and compute
+    fair probabilities + no-vig EV.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["fair_prob"] = np.nan
+    df["no_vig_ev"] = np.nan
+
+    group_cols = ["fixture_id", "market_id", "grouping_key"]
+
+    updates: List[pd.DataFrame] = []
+
+    for _, g in df.groupby(group_cols, dropna=False):
+        if g.empty:
+            continue
+
+        # best odds per selection
+        best = g.sort_values("price_decimal", ascending=False).groupby("selection").head(1)
+        if len(best) < 2:
+            continue
+
+        inv_sum = (1.0 / best["price_decimal"]).sum()
+        if inv_sum <= 0:
+            continue
+
+        best = best.copy()
+        best["fair_prob"] = (1.0 / best["price_decimal"]) / inv_sum
+        best["no_vig_ev"] = best["price_decimal"] * best["fair_prob"] - 1.0
+        updates.append(best[["fixture_id", "market_id", "grouping_key", "selection", "sportsbook", "fair_prob", "no_vig_ev"]])
+
+    if updates:
+        upd = pd.concat(updates, ignore_index=True)
+        df = df.merge(
+            upd,
+            on=["fixture_id", "market_id", "grouping_key", "selection", "sportsbook"],
+            how="left",
+            suffixes=("", "_upd"),
+        )
+        for col in ["fair_prob", "no_vig_ev"]:
+            df[col] = df[f"{col}_upd"].combine_first(df[col])
+            df.drop(columns=[f"{col}_upd"], inplace=True)
+
+    return df
+
+
+def efd_score_row(row: pd.Series) -> float:
+    """
+    Edge Force Dominion scoring:
+    - no_vig_ev              → math_comp
+    - |steam| (implied diff) → steam_comp
+    - minutes to start       → time_comp
+    - moneyline > spread > total weighting
+    Returns 0–100-ish score.
+    """
+    ev = float(row.get("no_vig_ev") or 0.0)
+    open_i = float(row.get("open_implied") or 0.0)
+    curr_i = float(row.get("implied_prob") or 0.0)
     steam = abs(curr_i - open_i)
+
     mins = row.get("minutes_to_start")
     try:
         mins = float(mins) if mins is not None else None
     except Exception:
         mins = None
-    market = (row.get("market_id") or "").lower()
 
-    ev_c = min(max(ev, -0.1), 0.12)
-    math_comp = (ev_c + 0.1) / 0.22
-    steam_c = min(steam, 0.1) / 0.1
+    market_id = str(row.get("market_id") or "").lower()
+
+    # compress EV into [0,1] window around [-0.10, +0.12]
+    ev_clamped = min(max(ev, -0.10), 0.12)
+    math_comp = (ev_clamped + 0.10) / 0.22  # 0–1
+
+    steam_clamped = min(steam, 0.10)
+    steam_comp = steam_clamped / 0.10  # 0–1
+
     if mins is None:
-        time_c = 0.5
+        time_comp = 0.5
     elif mins <= 0:
-        time_c = 1.0
+        time_comp = 1.0
     elif mins <= 360:
-        time_c = 1 - (mins / 360) * 0.5
+        time_comp = 1.0 - (mins / 360.0) * 0.5
     else:
-        time_c = 0.5
+        time_comp = 0.5
 
-    market_c = 1.0 if "moneyline" in market else 0.9 if "spread" in market else 0.85
-    score = (0.45 * math_comp + 0.35 * steam_c + 0.20 * time_c) * 100 * market_c
-    return float(round(score, 1))
+    if "moneyline" in market_id:
+        market_comp = 1.0
+    elif "spread" in market_id:
+        market_comp = 0.9
+    else:
+        market_comp = 0.85
+
+    score = (0.45 * math_comp + 0.35 * steam_comp + 0.20 * time_comp) * 100.0 * market_comp
+    return round(float(score), 1)
 
 
-def recompute_ev_efd(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+def enrich_board_with_ev_efd(board_df: pd.DataFrame, open_df: pd.DataFrame) -> pd.DataFrame:
+    if board_df.empty:
+        return board_df
 
-    df["curr_implied"] = df["price"].apply(implied_prob)
-    df["steam"] = df["curr_implied"] - df["open_implied"]
-    df["fair_prob"] = df["no_vig_ev"] = np.nan
+    df = board_df.copy()
 
-    grp_cols = ["fixture_id", "market_id", "grouping_key"]
+    # link to opening snapshot for steam vs open
+    merge_cols = ["fixture_id", "sportsbook", "market_id", "selection"]
+    open_cols = merge_cols + ["implied_prob"]
+    open_df_small = open_df[open_cols].rename(columns={"implied_prob": "open_implied"}) if not open_df.empty else pd.DataFrame()
 
-    updates = []
-    for _, g in df.groupby(grp_cols, as_index=False):
-        best = (
-            g.sort_values("price_decimal", ascending=False)
-            .groupby("selection", as_index=False)
-            .first()
-        )
-        if len(best) < 2:
-            continue
+    df = df.merge(open_df_small, on=merge_cols, how="left")
 
-        inv = (1 / best["price_decimal"]).sum()
-        if inv <= 0:
-            continue
+    # if this is the first snapshot, open_implied == current
+    df["open_implied"] = df["open_implied"].fillna(df["implied_prob"])
 
-        best["fair_prob"] = (1 / best["price_decimal"]) / inv
-        best["no_vig_ev"] = best["price_decimal"] * best["fair_prob"] - 1
-        updates.append(best)
-
-    if updates:
-        upd = pd.concat(updates, ignore_index=True)
-        df = df.merge(
-            upd[grp_cols + ["selection", "sportsbook", "fair_prob", "no_vig_ev"]],
-            on=grp_cols + ["selection", "sportsbook"],
-            how="left",
-            suffixes=("", "_u"),
-        )
-        df["fair_prob"] = df["fair_prob_u"].combine_first(df["fair_prob"])
-        df["no_vig_ev"] = df["no_vig_ev_u"].combine_first(df["no_vig_ev"])
-        df = df.drop(columns=[c for c in df.columns if c.endswith("_u")])
-
+    # minutes to start
     df["minutes_to_start"] = df["start_date"].apply(minutes_until)
-    df["efd_score"] = df.apply(efd_row, axis=1)
+
+    # compute fair probs + EV
+    df = compute_no_vig_ev(df)
+
+    # steam vs open
+    df["steam"] = df["implied_prob"] - df["open_implied"]
+
+    # EFD score
+    df["efd_score"] = df.apply(efd_score_row, axis=1)
+
     return df
 
-# ------------------------------------------------------------------
-# 🧵 BOOT SNAPSHOT
-# ------------------------------------------------------------------
-def boot_backend():
-    log_boot("Booting Edge Force Dominion…")
-    all_dfs = []
-    total = len(SPORTS_CONFIG)
-    status = st.empty()
+# -----------------------------------------------------------
+# SNAPSHOT BUILDER (CACHED)
+# -----------------------------------------------------------
 
-    for idx, (alias, cfg) in enumerate(SPORTS_CONFIG.items(), 1):
-        sport, league = cfg["sport"], cfg["league"]
-        log_boot(f"[{idx}/{total}] Fixtures → {alias.upper()}")
-        fixtures = fetch_fixtures(sport, league, days=2)
-        if fixtures.empty:
-            log_boot(f"No fixtures for {alias}")
+@st.cache_data(ttl=30)
+def build_snapshot(
+    api_key: str,
+    sports: Tuple[str, ...],
+    books: Tuple[str, ...],
+    markets: Tuple[str, ...],
+    run_id: int,
+) -> pd.DataFrame:
+    """
+    Pull fixtures + odds for selected sports.
+    run_id is only there to let us force-refresh cache.
+    """
+    _ = api_key  # just to tie cache to key
+    all_rows: List[pd.DataFrame] = []
+
+    for alias in sports:
+        cfg = SPORTS_CONFIG.get(alias)
+        if not cfg:
             continue
 
-        fids = fixtures["fixture_id"].tolist()
-        log_boot(f"Found {len(fids)} fixtures for {alias}")
-        odds = fetch_odds_chunks(
-            fids, CORE_MARKETS, st.session_state["sportsbooks"], status
-        )
-        if odds.empty:
-            log_boot(f"No odds for {alias}")
+        sport_id = cfg["sport"]
+        league_id = cfg["league"]
+
+        log_boot(f"{alias}: fixtures…")
+        fixtures_df = fetch_fixtures_for_sport(sport_id, league_id)
+        if fixtures_df.empty:
+            log_boot(f"{alias}: no fixtures.")
             continue
 
-        odds = odds.merge(
-            fixtures[
-                [
-                    "fixture_id",
-                    "home_logo",
-                    "away_logo",
-                    "status",
-                ]
-            ],
+        fixture_ids = fixtures_df["fixture_id"].tolist()
+        log_boot(f"{alias}: {len(fixture_ids)} fixtures; odds…")
+
+        odds_df = fetch_odds_for_fixtures(fixture_ids, list(markets), list(books))
+        if odds_df.empty:
+            log_boot(f"{alias}: no odds.")
+            continue
+
+        # add alias + logos by joining fixtures
+        odds_df = odds_df.merge(
+            fixtures_df[["fixture_id", "home_logo", "away_logo"]],
             on="fixture_id",
             how="left",
         )
+        odds_df["alias"] = alias
+        all_rows.append(odds_df)
 
-        odds["alias"] = alias
-        all_dfs.append(odds)
-
-        if idx < total:
-            time.sleep(SPORT_DELAY)
-
-    if not all_dfs:
-        log_boot("Zero data returned – check API key")
-        st.session_state["board_df"] = pd.DataFrame()
-        return
-
-    full = pd.concat(all_dfs, ignore_index=True)
-    log_boot("Computing EV + EFD…")
-    full = recompute_ev_efd(full)
-
-    st.session_state["board_df"] = full
-    st.session_state["history_df"] = full.copy()
-    st.session_state["boot_done"] = True
-    st.session_state["last_update"] = datetime.utcnow()
-    log_boot("Boot complete ✅")
-
-# ------------------------------------------------------------------
-# 🌐 SSE – LIVE ODDS STREAM
-# ------------------------------------------------------------------
-def _sse_worker(sport_alias: str):
-    """
-    Background thread: listen to /stream/odds/{sport} and push updates into a queue.
-    Adjust the URL/fields here if OpticOdds' docs differ.
-    """
-    cfg = SPORTS_CONFIG[sport_alias]
-    api_key = st.session_state["api_key"]
-    q = st.session_state["sse_queue"]
-
-    params = {
-        "key": api_key,
-        "league": cfg["league"],
-        "sportsbook": st.session_state["sportsbooks"],
-        "market": CORE_MARKETS,
-        "odds_format": "AMERICAN",
-    }
-
-    # If docs say it's /stream/odds?sport=, change this line only.
-    url = f"{OPTICODDS_BASE}/stream/odds/{cfg['sport']}"
-
-    try:
-        with requests.get(url, params=params, stream=True, timeout=60) as resp:
-            resp.raise_for_status()
-            client = sseclient.SSEClient(resp)
-
-            for event in client.events():
-                if not st.session_state.get("sse_running"):
-                    break
-                if not event.data:
-                    continue
-                try:
-                    payload = json.loads(event.data)
-                    q.put(payload)
-                except Exception:
-                    continue
-    except Exception as e:
-        q.put({"_error": f"SSE error for {sport_alias}: {e}"})
-    finally:
-        # thread will naturally die when flag flipped
-        st.session_state["sse_running"] = False
-
-
-def start_sse_streaming(sport_alias: str):
-    if st.session_state["sse_running"]:
-        return
-    st.session_state["sse_running"] = True
-    st.session_state["current_sport"] = sport_alias
-    th = threading.Thread(target=_sse_worker, args=(sport_alias,), daemon=True)
-    st.session_state["sse_thread"] = th
-    th.start()
-
-
-def stop_sse_streaming():
-    st.session_state["sse_running"] = False
-    th = st.session_state.get("sse_thread")
-    if th and th.is_alive():
-        # worker will exit on next event loop when it sees sse_running=False
-        pass
-
-
-def process_pending_updates():
-    """
-    Read SSE queue, update board_df prices, recompute EV/EFD.
-    """
-    board = st.session_state["board_df"]
-    if board.empty:
-        return
-
-    q = st.session_state["sse_queue"]
-    changed = False
-
-    while not q.empty():
-        msg = q.get()
-        if "_error" in msg:
-            log_boot(msg["_error"])
-            continue
-
-        data = msg.get("data") or msg
-
-        # Try to be robust to shape; adjust here once you see real SSE payloads.
-        fx = data.get("fixture") or {}
-        fid = data.get("fixture_id") or fx.get("id")
-        sportsbook = data.get("sportsbook")
-        selection = data.get("selection")
-        market_id = data.get("market_id") or data.get("market")
-        grouping_key = data.get("grouping_key")
-        price = data.get("price")
-
-        if not (fid and sportsbook and selection and market_id and price is not None):
-            continue
-
-        mask = (
-            (board["fixture_id"] == fid)
-            & (board["sportsbook"] == sportsbook)
-            & (board["selection"] == selection)
-            & (board["market_id"] == market_id)
-        )
-        if grouping_key is not None and "grouping_key" in board.columns:
-            mask &= board["grouping_key"].eq(grouping_key)
-
-        if not mask.any():
-            # If it's a brand new leg we don't know, ignore for now.
-            continue
-
-        idx = board.index[mask][0]
-        board.at[idx, "price"] = price
-        board.at[idx, "price_decimal"] = american_to_decimal(price)
-        changed = True
-
-        # Append to history for line-move analytics
-        hist = st.session_state["history_df"]
-        row_copy = board.loc[[idx]].copy()
-        row_copy["timestamp"] = datetime.utcnow().isoformat()
-        st.session_state["history_df"] = pd.concat(
-            [hist, row_copy], ignore_index=True
-        )
-
-    if changed:
-        board = recompute_ev_efd(board)
-        st.session_state["board_df"] = board
-        st.session_state["last_update"] = datetime.utcnow()
-
-# ------------------------------------------------------------------
-# 💰 ARBITRAGE ENGINE
-# ------------------------------------------------------------------
-def compute_arbitrage(df: pd.DataFrame, min_edge_pct: float = 0.25) -> pd.DataFrame:
-    """
-    Scan current board for cross-book arbitrage.
-    min_edge_pct is net profit % threshold to show.
-    """
-    if df.empty:
+    if not all_rows:
         return pd.DataFrame()
 
-    rows = []
+    return pd.concat(all_rows, ignore_index=True)
+
+# -----------------------------------------------------------
+# ARBITRAGE DETECTION
+# -----------------------------------------------------------
+
+def detect_arbitrage(board_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Simple 2-way market arbitrage: use best price per selection across books.
+    """
+    if board_df.empty:
+        return pd.DataFrame()
+
+    df = board_df.copy()
+    df = df.dropna(subset=["price_decimal"])
+
+    records: List[Dict] = []
+
     group_cols = ["fixture_id", "market_id", "grouping_key"]
 
-    for (_, market_id, gk), g in df.groupby(group_cols):
-        if g.empty:
-            continue
+    for (fixture_id, market_id, gk), g in df.groupby(group_cols, dropna=False):
+        # best odds per selection (across all books)
+        best_rows = g.sort_values("price_decimal", ascending=False).groupby("selection").head(1)
+        if len(best_rows) < 2:
+            continue  # need at least 2 selections for an arb
 
-        alias = g["alias"].iloc[0]
-        start = g["start_date"].iloc[0]
-        home = g["home_name"].iloc[0]
-        away = g["away_name"].iloc[0]
-        market_label = g["market_label"].iloc[0]
+        inv_sum = (1.0 / best_rows["price_decimal"]).sum()
+        if inv_sum >= 1.0:
+            continue  # no arbitrage
 
-        # Best price per selection across books
-        best = (
-            g.sort_values("price_decimal", ascending=False)
-            .groupby("selection", as_index=False)
-            .first()
-        )
-        if len(best) < 2:
-            continue
+        profit_pct = (1.0 / inv_sum - 1.0) * 100.0
 
-        implied_sum = (1 / best["price_decimal"]).sum()
-        if implied_sum >= 1:
-            continue
-
-        edge = (1 / implied_sum - 1) * 100
-        if edge < min_edge_pct:
-            continue
-
+        # Build leg description strings
         legs = []
-        for _, r in best.iterrows():
-            legs.append(
-                {
-                    "selection": r["selection"],
-                    "book": r["sportsbook"],
-                    "price": r["price"],
-                    "dec": r["price_decimal"],
-                }
-            )
+        for _, r in best_rows.iterrows():
+            legs.append(f"{r['selection']} @ {r['sportsbook']} ({r['price']})")
 
-        rows.append(
+        first_row = best_rows.iloc[0]
+        records.append(
             {
-                "fixture_id": g["fixture_id"].iloc[0],
-                "alias": alias,
-                "start_date": start,
-                "home_name": home,
-                "away_name": away,
-                "market_label": market_label,
-                "edge_pct": round(edge, 2),
-                "legs": legs,
+                "Sport": first_row.get("alias"),
+                "Start": first_row.get("start_date"),
+                "Home": first_row.get("home_name"),
+                "Away": first_row.get("away_name"),
+                "Market": first_row.get("market_label"),
+                "Arb Profit %": round(profit_pct, 2),
+                "Legs": " | ".join(legs),
             }
         )
 
-    if not rows:
+    if not records:
         return pd.DataFrame()
 
-    return pd.DataFrame(rows).sort_values("edge_pct", ascending=False)
+    out = pd.DataFrame(records).sort_values("Arb Profit %", ascending=False)
+    return out
 
-# ------------------------------------------------------------------
-# ⌨️ CONSOLE
-# ------------------------------------------------------------------
-def add_msg(role: str, text: str):
-    st.session_state["messages"].append({"role": role, "text": text})
+# -----------------------------------------------------------
+# BOARD RENDERING
+# -----------------------------------------------------------
 
-
-def handle_cmd(cmd: str):
-    cmd = cmd.strip()
-    if not cmd:
-        return
-    add_msg("user", cmd)
-    parts = cmd.lower().split()
-    verb = parts[0]
-    board = st.session_state["board_df"]
-
-    if verb in {"help", "?"}:
-        add_msg(
-            "system",
-            "Commands:\n- help\n- show all\n- show <sport>\n- show market <ml|spread|total>",
-        )
-        return
-    if board.empty:
-        add_msg("system", "Board empty – boot may have failed")
-        return
-    if verb == "show" and len(parts) >= 2:
-        if parts[1] == "all":
-            add_msg("system", "Showing all (use filters)")
-            return
-        if parts[1] == "market" and len(parts) >= 3:
-            m = parts[2]
-            add_msg("system", f"Filter Market = {m}")
-            return
-        alias = parts[1]
-        if alias not in SPORTS_CONFIG:
-            add_msg("system", f"Unknown sport {alias}")
-            return
-        add_msg("system", f"Filter Sport = {alias}")
-        return
-    add_msg("system", "Unknown cmd – try 'help'")
-
-
-def render_console():
-    st.subheader("⌨️ Command Console")
-    for m in st.session_state["messages"]:
-        cls = "cmd-user" if m["role"] == "user" else "cmd-system"
-        who = "You" if m["role"] == "user" else "System"
-        st.markdown(
-            f"<div class='{cls}'><b>{who}:</b> {m['text']}</div>",
-            unsafe_allow_html=True,
-        )
-    cmd = st.chat_input("Type command…")
-    if cmd:
-        handle_cmd(cmd)
-
-# ------------------------------------------------------------------
-# 🎮 DASHBOARD – MAIN BOARD
-# ------------------------------------------------------------------
-def render_board():
-    board = st.session_state["board_df"]
-    if board.empty:
-        st.error("Board empty – check boot log")
-        return
-
-    # status / controls
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        if st.session_state["sse_running"]:
-            st.success("🟢 LIVE")
-            if st.session_state["last_update"]:
-                st.caption(
-                    f"Last update: {st.session_state['last_update'].strftime('%H:%M:%S UTC')}"
-                )
-        else:
-            st.error("🔴 Offline")
-    with col2:
-        if st.session_state["sse_running"]:
-            if st.button("⏸️ Pause live"):
-                stop_sse_streaming()
-                st.rerun()
-        else:
-            if st.button("▶️ Start live"):
-                start_sse_streaming(st.session_state["current_sport"])
-                st.rerun()
-    with col3:
-        sport_sel = st.selectbox(
-            "Live Sport",
-            list(SPORTS_CONFIG.keys()),
-            index=list(SPORTS_CONFIG.keys()).index(
-                st.session_state["current_sport"]
-            ),
-            key="live_sport",
-        )
-        if sport_sel != st.session_state["current_sport"]:
-            stop_sse_streaming()
-            start_sse_streaming(sport_sel)
-            st.rerun()
-
-    st.markdown("---")
-
-    # filters
+def render_summary(board_df: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        sport_f = st.selectbox("Sport", ["all"] + list(SPORTS_CONFIG.keys()))
+        st.markdown('<div class="metric-label">Active Sports</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{board_df["alias"].nunique() if not board_df.empty else 0}</div>', unsafe_allow_html=True)
     with c2:
-        market_f = st.selectbox("Market", ["all", "moneyline", "spread", "total"])
+        st.markdown('<div class="metric-label">Tracked Sportsbooks</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-value">{board_df["sportsbook"].nunique() if not board_df.empty else 0}</div>',
+            unsafe_allow_html=True,
+        )
     with c3:
-        book_f = st.selectbox(
-            "Book", ["all"] + sorted(board["sportsbook"].dropna().unique())
+        st.markdown('<div class="metric-label">Fixtures</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-value">{board_df["fixture_id"].nunique() if not board_df.empty else 0}</div>',
+            unsafe_allow_html=True,
         )
     with c4:
-        sort = st.selectbox("Sort", ["EFD score", "EV", "Steam"])
+        st.markdown('<div class="metric-label">Rows Ingested</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{len(board_df)}</div>', unsafe_allow_html=True)
 
-    # apply SSE updates
-    if st.session_state["sse_running"]:
-        process_pending_updates()
 
-    df = board.copy()
-    if sport_f != "all":
-        df = df[df["alias"] == sport_f]
-    if market_f != "all":
-        df = df[df["market_id"].str.contains(market_f, case=False, na=False)]
-    if book_f != "all":
-        df = df[df["sportsbook"] == book_f]
+def render_matchup_cards(df: pd.DataFrame) -> None:
     if df.empty:
-        st.warning("No rows match filters")
+        st.info("No odds after filters.")
         return
 
-    if sort == "EV":
-        df = df.sort_values("no_vig_ev", ascending=False)
-    elif sort == "Steam":
-        df = df.sort_values("steam", ascending=False)
-    else:
-        df = df.sort_values("efd_score", ascending=False)
-
-    # matchup cards (top 8 fixtures)
-    st.subheader("🎮 Matchup Cards")
-    card_fixtures = (
+    # group by fixture
+    fixture_meta = (
         df.groupby("fixture_id")
         .agg(
-            {
-                "start_date": "first",
-                "home_name": "first",
-                "away_name": "first",
-                "home_logo": "first",
-                "away_logo": "first",
-            }
+            start_date=("start_date", "first"),
+            home_name=("home_name", "first"),
+            away_name=("away_name", "first"),
+            home_logo=("home_logo", "first"),
+            away_logo=("away_logo", "first"),
+            alias=("alias", "first"),
         )
         .reset_index()
-        .head(8)
     )
 
-    for _, row in card_fixtures.iterrows():
-        a, b = st.columns([2, 3])
-        with a:
+    # we sort fixtures by top EFD in that fixture
+    fixture_scores = (
+        df.groupby("fixture_id")["efd_score"]
+        .max()
+        .reset_index()
+        .rename(columns={"efd_score": "top_efd"})
+    )
+    fixture_meta = fixture_meta.merge(fixture_scores, on="fixture_id", how="left")
+    fixture_meta = fixture_meta.sort_values("top_efd", ascending=False).head(15)
+
+    for _, meta in fixture_meta.iterrows():
+        sub = df[df["fixture_id"] == meta["fixture_id"]]
+        ml = sub[sub["market_id"].str.contains("moneyline", case=False, na=False)]
+        sp = sub[sub["market_id"].str.contains("spread", case=False, na=False)]
+        tot = sub[sub["market_id"].str.contains("total", case=False, na=False)]
+
+        def best_row(mdf: pd.DataFrame) -> Optional[pd.Series]:
+            if mdf.empty:
+                return None
+            return mdf.sort_values("efd_score", ascending=False).iloc[0]
+
+        best_ml = best_row(ml)
+        best_sp = best_row(sp)
+        best_tot = best_row(tot)
+
+        col_left, col_right = st.columns([2, 3])
+
+        with col_left:
             st.markdown('<div class="fixture-card">', unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="fixture-header">{row["start_date"]}</div>',
-                unsafe_allow_html=True,
-            )
+            start = meta["start_date"] or ""
+            alias = meta["alias"] or ""
+            header = f"{alias} • {start}"
+            st.markdown(f'<div class="fixture-header">{header}</div>', unsafe_allow_html=True)
+
             lc1, lc2 = st.columns(2)
             with lc1:
-                if row["home_logo"]:
-                    st.image(row["home_logo"], width=48)
-                st.markdown(
-                    f'<span class="team-name">{row["home_name"]}</span>',
-                    unsafe_allow_html=True,
-                )
+                if meta["home_logo"]:
+                    st.image(meta["home_logo"], width=48)
+                st.markdown(f'<span class="team-name">{meta["home_name"]}</span>', unsafe_allow_html=True)
             with lc2:
-                if row["away_logo"]:
-                    st.image(row["away_logo"], width=48)
+                if meta["away_logo"]:
+                    st.image(meta["away_logo"], width=48)
+                st.markdown(f'<span class="team-name">{meta["away_name"]}</span>', unsafe_allow_html=True)
+
+            if not np.isnan(meta.get("top_efd", np.nan)):
                 st.markdown(
-                    f'<span class="team-name">{row["away_name"]}</span>',
+                    f"<div style='margin-top:6px'>Top EFD<span class=\"efd-pill\">{meta['top_efd']:.1f}</span></div>",
                     unsafe_allow_html=True,
                 )
             st.markdown("</div>", unsafe_allow_html=True)
 
-        with b:
-            st.write("Top prices (ML / Spread / Total):")
-            sub = df[df["fixture_id"] == row["fixture_id"]]
-            ml = sub[
-                sub["market_id"].str.contains("moneyline", case=False, na=False)
-            ]
-            sp = sub[sub["market_id"].str.contains("spread", case=False, na=False)]
-            tot = sub[sub["market_id"].str.contains("total", case=False, na=False)]
-
-            def summarise(mdf, label):
-                if mdf.empty:
-                    return f"**{label}:** —"
-                top = mdf.sort_values("price_decimal", ascending=False).iloc[0]
-                return (
-                    f"**{label}:** {top['sportsbook']} – {top['name']} "
-                    f"({top['price']}, EFD {top['efd_score']:.1f})"
+        with col_right:
+            st.write("Top bets by EFD:")
+            lines = []
+            if best_ml is not None:
+                lines.append(
+                    f"**Moneyline:** {best_ml['sportsbook']} – {best_ml['name']} "
+                    f"({best_ml['price']}) • EFD {best_ml['efd_score']:.1f}"
                 )
-
-            st.markdown(
-                "<div class='odds-row'>"
-                + summarise(ml, "Moneyline")
-                + "<br>"
-                + summarise(sp, "Spread")
-                + "<br>"
-                + summarise(tot, "Total")
-                + "</div>",
-                unsafe_allow_html=True,
-            )
+            if best_sp is not None:
+                pt = best_sp['points']
+                pt_str = f"{pt:+}" if pt is not None else ""
+                lines.append(
+                    f"**Spread:** {best_sp['sportsbook']} – {best_sp['name']} {pt_str} "
+                    f"({best_sp['price']}) • EFD {best_sp['efd_score']:.1f}"
+                )
+            if best_tot is not None:
+                pt = best_tot['points']
+                lines.append(
+                    f"**Total:** {best_tot['sportsbook']} – {best_tot['name']} {pt} "
+                    f"({best_tot['price']}) • EFD {best_tot['efd_score']:.1f}"
+                )
+            if lines:
+                st.markdown("<div class='odds-row'>" + "<br>".join(lines) + "</div>", unsafe_allow_html=True)
+            else:
+                st.caption("No core markets found for this fixture.")
 
         st.markdown("---")
 
-    # table
-    st.subheader("📊 Full Board (top 250)")
+
+def render_board() -> None:
+    board = st.session_state["board_df"]
+    if board.empty:
+        st.error("No odds data loaded. Check boot log & API key.")
+        return
+
+    # filters
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        sport_opt = ["All"] + list(SPORTS_CONFIG.keys())
+        sport_f = st.selectbox("Sport", sport_opt, index=0)
+    with col2:
+        market_opt = ["All", "moneyline", "spread", "total"]
+        market_f = st.selectbox("Market", market_opt, index=0)
+    with col3:
+        book_opt = ["All"] + sorted(board["sportsbook"].dropna().unique().tolist())
+        book_f = st.selectbox("Sportsbook", book_opt, index=0)
+    with col4:
+        sort_opt = ["EFD score", "EV", "Steam"]
+        sort_by = st.selectbox("Sort by", sort_opt, index=0)
+
+    df = board.copy()
+    if sport_f != "All":
+        df = df[df["alias"] == sport_f]
+    if market_f != "All":
+        df = df[df["market_id"].str.contains(market_f, case=False, na=False)]
+    if book_f != "All":
+        df = df[df["sportsbook"] == book_f]
+
+    if df.empty:
+        st.warning("No rows match current filters.")
+        return
+
+    if sort_by == "EV":
+        df = df.sort_values("no_vig_ev", ascending=False)
+    elif sort_by == "Steam":
+        df = df.sort_values("steam", ascending=False)
+    else:
+        df = df.sort_values("efd_score", ascending=False)
+
+    st.subheader("Matchups ordered by EFD")
+    render_matchup_cards(df)
+
+    st.subheader("Full Board (Top 250 rows)")
     show_cols = [
         "alias",
         "start_date",
@@ -814,7 +722,8 @@ def render_board():
         "steam",
         "efd_score",
     ]
-    tmp = df[show_cols].rename(
+    tbl = df[show_cols].copy()
+    tbl.rename(
         columns={
             "alias": "Sport",
             "start_date": "Start",
@@ -824,250 +733,197 @@ def render_board():
             "market_label": "Market",
             "name": "Bet",
             "price": "Odds",
+            "no_vig_ev": "EV",
             "efd_score": "EFD",
-        }
+            "steam": "Steam",
+        },
+        inplace=True,
     )
-    tmp["EV%"] = tmp["no_vig_ev"].apply(lambda v: f"{(v or 0) * 100:.1f}%")
-    tmp["Steam%"] = tmp["steam"].apply(lambda v: f"{(v or 0) * 100:.1f}%")
+    tbl["EV %"] = tbl["EV"].apply(lambda v: f"{(v or 0)*100:.1f}%")
+    tbl["Steam %"] = tbl["Steam"].apply(lambda v: f"{(v or 0)*100:.1f}%")
     st.dataframe(
-        tmp[
-            [
-                "Sport",
-                "Start",
-                "Home",
-                "Away",
-                "Book",
-                "Market",
-                "Bet",
-                "Odds",
-                "EV%",
-                "Steam%",
-                "EFD",
-            ]
-        ].head(250),
+        tbl[["Sport", "Start", "Home", "Away", "Book", "Market", "Bet", "Odds", "EV %", "Steam %", "EFD"]].head(250),
         use_container_width=True,
     )
 
-# ------------------------------------------------------------------
-# 💰 ARBITRAGE TAB
-# ------------------------------------------------------------------
-def render_arbitrage():
-    df = st.session_state["board_df"]
-    if df.empty:
-        st.warning("No board data yet.")
-        return
+# -----------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------
 
-    arb_df = compute_arbitrage(df, min_edge_pct=0.25)
-    st.subheader("💰 Live Arbitrage Opportunities")
-
-    if arb_df.empty:
-        st.info("No true arbitrage found at the moment (edge < 0.25%).")
-        return
-
-    for _, row in arb_df.head(50).iterrows():
-        st.markdown("----")
-        st.markdown(
-            f"**{row['alias'].upper()} – {row['home_name']} vs {row['away_name']}**  "
-        )
-        st.caption(f"{row['start_date']}  |  {row['market_label']}")
-        st.markdown(f"**Edge:** {row['edge_pct']:.2f}%")
-        for leg in row["legs"]:
-            st.markdown(
-                f"- {leg['selection']} – {leg['book']} @ {leg['price']} "
-                f"(dec {leg['dec']:.3f})"
-            )
-
-# ------------------------------------------------------------------
-# 📈 LINE MOVES TAB
-# ------------------------------------------------------------------
-def render_line_moves():
-    df = st.session_state["board_df"]
-    if df.empty:
-        st.warning("No board data yet.")
-        return
-
-    st.subheader("📈 Steam & Reverse Line Movement")
-
-    # label direction: positive steam = to dog, negative = to fav
-    df = df.copy()
-    df["steam_bp"] = df["steam"] * 10000
-    df["direction"] = np.where(
-        df["steam"] > 0, "Steam to underdog", np.where(df["steam"] < 0, "Steam to favorite", "Flat")
-    )
-
-    sport_f = st.selectbox("Sport", ["all"] + list(SPORTS_CONFIG.keys()), key="lm_sport")
-    market_f = st.selectbox(
-        "Market", ["all", "moneyline", "spread", "total"], key="lm_market"
-    )
-
-    if sport_f != "all":
-        df = df[df["alias"] == sport_f]
-    if market_f != "all":
-        df = df[df["market_id"].str.contains(market_f, case=False, na=False)]
-
-    if df.empty:
-        st.warning("No rows match filters.")
-        return
-
-    # show strongest moves
-    df = df.sort_values("steam_bp", ascending=False)
-
-    cols = [
-        "alias",
-        "start_date",
-        "home_name",
-        "away_name",
-        "sportsbook",
-        "market_label",
-        "name",
-        "price",
-        "open_price",
-        "steam",
-        "direction",
-    ]
-    out = df[cols].rename(
-        columns={
-            "alias": "Sport",
-            "start_date": "Start",
-            "home_name": "Home",
-            "away_name": "Away",
-            "sportsbook": "Book",
-            "market_label": "Market",
-            "name": "Bet",
-            "price": "Current",
-            "open_price": "Open",
-            "steam": "SteamΔ",
-            "direction": "Direction",
-        }
-    )
-    out["SteamΔ (bps)"] = (out["SteamΔ"] * 10000).round(1)
-    st.dataframe(
-        out[
-            [
-                "Sport",
-                "Start",
-                "Home",
-                "Away",
-                "Book",
-                "Market",
-                "Bet",
-                "Open",
-                "Current",
-                "SteamΔ (bps)",
-                "Direction",
-            ]
-        ].head(250),
-        use_container_width=True,
-    )
-
-# ------------------------------------------------------------------
-# 📊 ANALYTICS TAB
-# ------------------------------------------------------------------
-def render_analytics():
-    df = st.session_state["board_df"]
-    if df.empty:
-        st.warning("No board data yet.")
-        return
-
-    st.subheader("📊 Advanced Analytics")
-
-    total = len(df)
-    pos_ev = (df["no_vig_ev"] > 0).sum()
-    avg_efd = df["efd_score"].mean()
-    avg_ev = df["no_vig_ev"].mean() * 100
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Total rows", total)
-    with c2:
-        pct = (pos_ev / total * 100) if total else 0
-        st.metric("EV > 0 selections", f"{pos_ev} ({pct:.1f}%)")
-    with c3:
-        st.metric("Avg EFD score", f"{avg_efd:.1f}")
-
-    st.caption(f"Average no-vig EV across board: {avg_ev:.2f}%")
-
-# ------------------------------------------------------------------
-# 🧵 MAIN
-# ------------------------------------------------------------------
-def main():
+def main() -> None:
     init_state()
     inject_theme()
-    st.title("⚡ Edge Force Dominion – Global Odds Engine")
 
-    # light auto-refresh while live
+    st.title("🏆 Edge Force Dominion — OpticOdds Live Dashboard")
+    st.caption("Snapshot + refresh live odds with EV, EFD scoring, line moves, and arbitrage radar.")
+
+    # auto-refresh every few seconds once booted
     if st.session_state["boot_done"]:
-        st_autorefresh(interval=3000, key="oddsrefresher")
+        st_autorefresh(interval=10000, key="efd_auto_refresh")
 
-    # API key config
+    # sidebar controls
+    with st.sidebar:
+        st.markdown("### OpticOdds Configuration")
+        key_input = st.text_input(
+            "API Key",
+            value=st.session_state["api_key"],
+            type="password",
+            help="Stored in session only (or from Streamlit secrets / env).",
+        )
+        if key_input:
+            st.session_state["api_key"] = key_input
+
+        st.markdown("### Sportsbooks")
+        books_str = ", ".join(st.session_state["sportsbooks"])
+        books_input = st.text_area(
+            "Comma-separated list",
+            value=books_str,
+            height=80,
+        )
+        chosen_books = [b.strip() for b in books_input.split(",") if b.strip()]
+        if chosen_books:
+            st.session_state["sportsbooks"] = chosen_books
+
+        st.markdown("### Sports")
+        sports_multi = st.multiselect(
+            "Tracked sports",
+            options=list(SPORTS_CONFIG.keys()),
+            default=["NBA", "NFL", "NCAAF", "NCAAB"],
+        )
+
+        st.markdown("### Markets")
+        markets_multi = st.multiselect(
+            "Markets",
+            options=CORE_MARKETS,
+            default=CORE_MARKETS,
+        )
+
+        st.markdown("---")
+        if st.button("Run Snapshot / Refresh Now"):
+            st.session_state["snapshot_run_id"] += 1
+            st.session_state["boot_done"] = False  # force rebuild
+
     if not st.session_state["api_key"]:
-        st.warning("⚠️ No OpticOdds API key!")
-        with st.expander("🔑 How to add OpticOdds API key", expanded=True):
-            st.markdown(
-                """
-                **Local dev**: create `.env` with  
-                `OPTICODDS_API_KEY=your_key`  
-
-                **Streamlit Cloud**: Settings → Secrets →  
-
-                ```toml
-                [opticodds]
-                api_key = "your_key"
-                ```
-                """
-            )
+        st.warning("Add your OpticOdds API key in the sidebar to begin.")
         return
 
-    with st.sidebar:
-        st.markdown("### 🔐 OpticOdds API Key")
-        key_inp = st.text_input(
-            "API key", value=st.session_state["api_key"], type="password"
-        )
-        if key_inp:
-            st.session_state["api_key"] = key_inp
-
-        st.markdown("### 📚 Sportsbooks")
-        books_inp = st.text_area(
-            "Comma-separated", ", ".join(st.session_state["sportsbooks"])
-        )
-        st.session_state["sportsbooks"] = [
-            b.strip() for b in books_inp.split(",") if b.strip()
-        ]
-
-    # initial boot
+    # first-time boot or forced refresh
     if not st.session_state["boot_done"]:
-        st.subheader("🧩 Booting Edge Force Dominion Board")
-        with st.spinner("Pulling fixtures + odds for all sports…"):
-            boot_backend()
-        with st.expander("Boot log"):
+        st.subheader("Booting Edge Force Dominion Board")
+        with st.spinner("Pulling fixtures & odds from OpticOdds…"):
+            board_snapshot = build_snapshot(
+                api_key=st.session_state["api_key"],
+                sports=tuple(sports_multi),
+                books=tuple(st.session_state["sportsbooks"]),
+                markets=tuple(markets_multi),
+                run_id=st.session_state["snapshot_run_id"],
+            )
+
+        if board_snapshot.empty:
+            st.error("No odds came back from OpticOdds. Check key, sport/league coverage, and account access.")
+            with st.expander("Boot log", expanded=True):
+                for line in st.session_state["boot_log"]:
+                    st.markdown(f"- {line}")
+            return
+
+        # If we don't have an "open" board yet, set it to this snapshot
+        if st.session_state["open_board_df"].empty:
+            st.session_state["open_board_df"] = board_snapshot.copy()
+
+        # enrich with EV / EFD using existing open snapshot
+        enriched = enrich_board_with_ev_efd(board_snapshot, st.session_state["open_board_df"])
+
+        st.session_state["board_df"] = enriched
+        st.session_state["boot_done"] = True
+        st.session_state["last_snapshot_ts"] = datetime.utcnow()
+
+    # dashboard tabs
+    board_df = st.session_state["board_df"]
+
+    tabs = st.tabs(["Dashboard", "Arbitrage", "Line Moves", "Analytics", "Boot Log"])
+
+    with tabs[0]:
+        st.subheader("Live Dashboard")
+        render_summary(board_df)
+        if st.session_state["last_snapshot_ts"]:
+            ts = st.session_state["last_snapshot_ts"].strftime("%H:%M:%S UTC")
+            st.caption(f"Last snapshot: {ts}")
+        st.markdown("---")
+        render_board()
+
+    with tabs[1]:
+        st.subheader("Arbitrage Opportunities")
+        arb_df = detect_arbitrage(board_df)
+        if arb_df.empty:
+            st.info("No clean 2-way arbitrage spots detected in the current snapshot.")
+        else:
+            st.dataframe(arb_df, use_container_width=True)
+
+    with tabs[2]:
+        st.subheader("Line Movement (Steam vs Session Open)")
+        if board_df.empty or st.session_state["open_board_df"].empty:
+            st.info("Need at least one snapshot to track line movement.")
+        else:
+            lm = board_df.copy()
+            lm["Steam %"] = lm["steam"].apply(lambda v: f"{(v or 0)*100:.2f}%")
+            lm_small = lm[
+                [
+                    "alias",
+                    "start_date",
+                    "home_name",
+                    "away_name",
+                    "sportsbook",
+                    "market_label",
+                    "name",
+                    "price",
+                    "Steam %",
+                    "efd_score",
+                ]
+            ].rename(
+                columns={
+                    "alias": "Sport",
+                    "start_date": "Start",
+                    "home_name": "Home",
+                    "away_name": "Away",
+                    "sportsbook": "Book",
+                    "market_label": "Market",
+                    "name": "Bet",
+                    "price": "Odds",
+                    "efd_score": "EFD",
+                }
+            )
+            lm_small = lm_small.sort_values("EFD", ascending=False).head(200)
+            st.dataframe(lm_small, use_container_width=True)
+
+    with tabs[3]:
+        st.subheader("Analytics")
+        if board_df.empty:
+            st.info("No data yet.")
+        else:
+            by_sport = (
+                board_df.groupby("alias")
+                .agg(
+                    fixtures=("fixture_id", "nunique"),
+                    books=("sportsbook", "nunique"),
+                    avg_efd=("efd_score", "mean"),
+                    max_efd=("efd_score", "max"),
+                )
+                .reset_index()
+                .rename(columns={"alias": "Sport"})
+            )
+            st.markdown("#### By Sport")
+            st.dataframe(by_sport, use_container_width=True)
+
+            st.markdown("#### EFD Score Distribution (sample)")
+            st.bar_chart(board_df["efd_score"].fillna(0).clip(0, 120))
+
+    with tabs[4]:
+        st.subheader("Boot Log")
+        if not st.session_state["boot_log"]:
+            st.caption("No log entries yet.")
+        else:
             for line in st.session_state["boot_log"]:
                 st.markdown(f"- {line}")
-        st.stop()
-
-    # auto-start SSE once booted
-    if st.session_state["boot_done"] and not st.session_state["sse_running"]:
-        start_sse_streaming(st.session_state["current_sport"])
-
-    with st.expander("Boot log", expanded=False):
-        for line in st.session_state["boot_log"]:
-            st.markdown(f"- {line}")
-
-    # Tabs: Dashboard / Arbitrage / Line Moves / Analytics
-    tab_dash, tab_arb, tab_line, tab_ana = st.tabs(
-        ["🏠 Dashboard", "💰 Arbitrage", "📈 Line Moves", "📊 Analytics"]
-    )
-
-    with tab_dash:
-        render_board()
-    with tab_arb:
-        render_arbitrage()
-    with tab_line:
-        render_line_moves()
-    with tab_ana:
-        render_analytics()
-
-    st.markdown("---")
-    render_console()
 
 
 if __name__ == "__main__":
