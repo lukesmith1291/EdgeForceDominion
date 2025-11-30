@@ -1,4 +1,3 @@
-Here's the complete, production-ready code with persistent SSE streaming that auto-starts after boot:
 import os
 import json
 import threading
@@ -80,11 +79,6 @@ def inject_theme():
         }
         .cmd-system {
             color: #a5b4fc;
-        }
-        .status-indicator {
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-weight: 600;
         }
         </style>
         """,
@@ -254,11 +248,8 @@ def fetch_odds_for_fixtures(
     df = pd.DataFrame(rows)
     df["price_decimal"] = df["price"].apply(american_to_decimal)
     df["implied_prob"] = df["price"].apply(implied_prob)
-    
-    # Store opening odds snapshot
     df["open_price"] = df["price"]
     df["open_implied"] = df["implied_prob"]
-    
     return df
 
 # ======================================
@@ -321,13 +312,9 @@ def recompute_ev_and_efd(board_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Current implied from latest price
     df["curr_implied"] = df["price"].apply(implied_prob)
-
-    # Steam
     df["steam"] = df["curr_implied"] - df["open_implied"]
 
-    # No-vig EV
     df["fair_prob"] = np.nan
     df["no_vig_ev"] = np.nan
 
@@ -337,7 +324,6 @@ def recompute_ev_and_efd(board_df: pd.DataFrame) -> pd.DataFrame:
     updates = []
 
     for _, g in grouped:
-        # Best prices per selection
         best = (
             g.sort_values("price_decimal", ascending=False)
              .groupby("selection", as_index=False)
@@ -367,10 +353,7 @@ def recompute_ev_and_efd(board_df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col + "_upd"].combine_first(df[col])
             df.drop(columns=[col + "_upd"], inplace=True)
 
-    # Minutes to start
     df["minutes_to_start"] = df["start_date"].apply(minutes_until)
-
-    # EFD score
     df["efd_score"] = df.apply(compute_efd_score_row, axis=1)
 
     return df
@@ -479,7 +462,7 @@ def sse_listener(sport_id: str, league_id: str, sportsbooks: List[str], markets:
                             
         except Exception as e:
             st.session_state["sse_queue"].put({"type": "error", "message": str(e)})
-            time.sleep(5)  # Backoff before retry
+            time.sleep(5)
 
 def start_sse_streaming(sport_alias: str):
     """Start SSE listener for a specific sport."""
@@ -532,56 +515,374 @@ def process_pending_updates() -> bool:
     return False
 
 # ======================================
-# 🧵 LIVE STREAM (SINGLE CHUNK)
+# 🧠 COMMAND CONSOLE
 # ======================================
 
-def stream_live_odds_chunk(
-    sport_id: str,
-    league_id: str,
-    sportsbooks: List[str],
-    markets: List[str],
-    max_events: int = 80,
-    timeout: int = 10,
-) -> List[dict]:
-    """Legacy function kept for fallback, but not used by persistent SSE."""
-    params = {
-        "league": league_id,
-        "sportsbook": ",".join(sportsbooks),
-        "market": ",".join(markets),
-        "odds_format": "AMERICAN",
-        "key": st.session_state["api_key"],
-    }
-    url = f"{OPTICODDS_BASE}/stream/odds/{sport_id}"
+def add_message(role: str, text: str):
+    st.session_state["messages"].append({"role": role, "text": text})
 
-    headers = {"Accept": "text/event-stream"}
+def handle_command(cmd: str):
+    cmd = cmd.strip()
+    if not cmd:
+        return
+    add_message("user", cmd)
 
-    with requests.get(url, params=params, headers=headers, stream=True, timeout=timeout) as resp:
-        resp.raise_for_status()
-        client = sseclient.SSEClient(resp)
-        events = []
-        count = 0
-        for event in client.events():
-            if event.data:
-                try:
-                    data = json.loads(event.data)
-                    events.append(data)
-                except json.JSONDecodeError:
-                    pass
-            count += 1
-            if count >= max_events:
-                break
-        return events
+    parts = cmd.lower().split()
+    if not parts:
+        return
 
-def apply_stream_events(board_df: pd.DataFrame, events: List[dict]) -> pd.DataFrame:
-    """Map SSE events to board price updates, then recompute EV+EFD."""
-    df = board_df.copy()
-    if df.empty or not events:
-        return df
+    verb = parts[0]
+    board = st.session_state["board_df"]
 
-    update_count = 0
-    for ev in events:
-        fixture_id = ev.get("fixture_id") or ev.get("fixture", {}).get("id")
-        odds_list = ev.get("odds", [])
+    if verb in ["help", "?"]:
+        add_message(
+            "system",
+            "Commands:\n"
+            "- help\n"
+            "- show all\n"
+            "- show <sport> (nba, nfl, mlb, nhl, ncaab, ncaaf)\n"
+            "- show market <ml|spread|total>",
+        )
+        return
 
+    if board.empty:
+        add_message("system", "Board is empty (boot may have failed).")
+        return
 
+    if verb == "show" and len(parts) >= 2:
+        if parts[1] == "all":
+            add_message("system", "Showing all sports (use filters above).")
+            return
+        if parts[1] == "market" and len(parts) >= 3:
+            m = parts[2]
+            if m == "ml":
+                add_message("system", "Showing moneyline (filter Market = ML).")
+            elif m == "spread":
+                add_message("system", "Showing spreads.")
+            elif m == "total":
+                add_message("system", "Showing totals.")
+            else:
+                add_message("system", f"Unknown market {m}. Use ml/spread/total.")
+            return
 
+        sport_alias = parts[1]
+        if sport_alias not in SPORTS_CONFIG:
+            add_message("system", f"Unknown sport {sport_alias}.")
+            return
+        add_message("system", f"Showing {sport_alias.upper()} (filter Sport = {sport_alias}).")
+        return
+
+    add_message("system", f"Unknown command: {cmd}. Type 'help'.")
+
+def render_console():
+    st.subheader("⌨️ Command Console")
+
+    for msg in st.session_state["messages"]:
+        cls = "cmd-user" if msg["role"] == "user" else "cmd-system"
+        who = "You" if msg["role"] == "user" else "System"
+        st.markdown(
+            f"<div class='{cls}'><b>{who}:</b> {msg['text']}</div>",
+            unsafe_allow_html=True,
+        )
+
+    cmd = st.chat_input("Type a command (e.g. 'show nba', 'show market ml', 'help')")
+    if cmd is not None:
+        handle_command(cmd)
+
+# ======================================
+# 🎨 BOARD RENDER
+# ======================================
+
+def render_board():
+    board = st.session_state["board_df"]
+    if board.empty:
+        st.error("Board is empty. Check boot log for API errors.")
+        return
+
+    # === STREAMING STATUS & CONTROLS ===
+    col_status, col_ctrl, col_sport = st.columns([2, 1, 1])
+    
+    with col_status:
+        if st.session_state["sse_running"]:
+            st.success("🟢 LIVE – Streaming updates")
+            if st.session_state["last_update"]:
+                st.caption(f"Last: {st.session_state['last_update'].strftime('%H:%M:%S UTC')}")
+        else:
+            st.error("🔴 Offline – No live updates")
+    
+    with col_ctrl:
+        if st.session_state["sse_running"]:
+            if st.button("⏸️ Pause", use_container_width=True):
+                stop_sse_streaming()
+                st.rerun()
+        else:
+            if st.button("▶️ Start Live", use_container_width=True):
+                start_sse_streaming(st.session_state["current_sport_filter"])
+                st.rerun()
+    
+    with col_sport:
+        sport_filter = st.selectbox(
+            "Live Sport",
+            list(SPORTS_CONFIG.keys()),
+            index=list(SPORTS_CONFIG.keys()).index(st.session_state["current_sport_filter"]),
+            key="live_sport_select",
+        )
+        if sport_filter != st.session_state["current_sport_filter"]:
+            stop_sse_streaming()
+            start_sse_streaming(sport_filter)
+            st.rerun()
+    
+    st.markdown("---")
+
+    # === FILTERS ===
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        sport_filter = st.selectbox(
+            "Sport",
+            ["all"] + list(SPORTS_CONFIG.keys()),
+            index=0,
+        )
+    with col2:
+        market_filter = st.selectbox(
+            "Market",
+            ["all", "moneyline", "spread", "total"],
+            index=0,
+        )
+    with col3:
+        book_filter = st.selectbox(
+            "Sportsbook",
+            ["all"] + sorted(board["sportsbook"].dropna().unique().tolist()),
+            index=0,
+        )
+    with col4:
+        sort_mode = st.selectbox(
+            "Sort by",
+            ["EFD score", "EV", "Steam"],
+            index=0,
+        )
+
+    # Process any pending SSE updates on every rerun
+    if st.session_state["sse_running"]:
+        process_pending_updates()
+
+    # Apply filters
+    df = board.copy()
+    if sport_filter != "all":
+        df = df[df["alias"] == sport_filter]
+    if market_filter != "all":
+        if market_filter == "moneyline":
+            df = df[df["market_id"].str.contains("moneyline", case=False, na=False)]
+        elif market_filter == "spread":
+            df = df[df["market_id"].str.contains("spread", case=False, na=False)]
+        elif market_filter == "total":
+            df = df[df["market_id"].str.contains("total", case=False, na=False)]
+    if book_filter != "all":
+        df = df[df["sportsbook"] == book_filter]
+    if df.empty:
+        st.warning("No rows match the current filters.")
+        return
+
+    # Sorting
+    if sort_mode == "EV":
+        df = df.sort_values("no_vig_ev", ascending=False)
+    elif sort_mode == "Steam":
+        df = df.sort_values("steam", ascending=False)
+    else:
+        df = df.sort_values("efd_score", ascending=False)
+
+    # --- Cards (top fixtures) ---
+    st.subheader("🎮 Matchup Cards")
+    by_fixture = (
+        df.groupby("fixture_id")
+        .agg(
+            {
+                "start_date": "first",
+                "home_name": "first",
+                "away_name": "first",
+                "home_logo": "first",
+                "away_logo": "first",
+            }
+        )
+        .reset_index()
+    ).head(8)
+
+    for _, row in by_fixture.iterrows():
+        fid = row["fixture_id"]
+        subset = df[df["fixture_id"] == fid]
+
+        colA, colB = st.columns([2, 3])
+
+        with colA:
+            st.markdown('<div class="fixture-card">', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="fixture-header">{row["start_date"]}</div>',
+                unsafe_allow_html=True,
+            )
+            logo_cols = st.columns(2)
+            with logo_cols[0]:
+                if isinstance(row["home_logo"], str):
+                    st.image(row["home_logo"], width=48)
+                st.markdown(
+                    f'<span class="team-name">{row["home_name"]}</span>',
+                    unsafe_allow_html=True,
+                )
+            with logo_cols[1]:
+                if isinstance(row["away_logo"], str):
+                    st.image(row["away_logo"], width=48)
+                st.markdown(
+                    f'<span class="team-name">{row["away_name"]}</span>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with colB:
+            st.write("Top prices (Moneyline / Spread / Total):")
+
+            ml = subset[subset["market_id"].str.contains("moneyline", case=False, na=False)]
+            sp = subset[subset["market_id"].str.contains("spread", case=False, na=False)]
+            tot = subset[subset["market_id"].str.contains("total", case=False, na=False)]
+
+            def summarize(market_df: pd.DataFrame, label: str):
+                if market_df.empty:
+                    return f"**{label}:** —"
+                best = market_df.sort_values("price_decimal", ascending=False).iloc[0]
+                return f"**{label}:** {best['sportsbook']} – {best['name']} ({best['price']}, EFD {best['efd_score']:.1f})"
+
+            st.markdown(
+                "<div class='odds-row'>"
+                + summarize(ml, "Moneyline")
+                + "<br>"
+                + summarize(sp, "Spread")
+                + "<br>"
+                + summarize(tot, "Total")
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+    # --- Full board table ---
+    st.subheader("📊 Full Board (top 250 rows)")
+    show_cols = [
+        "alias",
+        "start_date",
+        "home_name",
+        "away_name",
+        "sportsbook",
+        "market_label",
+        "name",
+        "price",
+        "no_vig_ev",
+        "steam",
+        "efd_score",
+    ]
+    tmp = df[show_cols].copy()
+    tmp["EV%"] = tmp["no_vig_ev"].apply(lambda v: f"{(v or 0)*100:.1f}%")
+    tmp["Steam%"] = tmp["steam"].apply(lambda v: f"{(v or 0)*100:.1f}%")
+
+    tmp = tmp.rename(
+        columns={
+            "alias": "Sport",
+            "start_date": "Start",
+            "home_name": "Home",
+            "away_name": "Away",
+            "sportsbook": "Book",
+            "market_label": "Market",
+            "name": "Bet",
+            "price": "Odds",
+            "efd_score": "EFD",
+        }
+    )
+
+    st.dataframe(
+        tmp[
+            [
+                "Sport",
+                "Start",
+                "Home",
+                "Away",
+                "Book",
+                "Market",
+                "Bet",
+                "Odds",
+                "EV%",
+                "Steam%",
+                "EFD",
+            ]
+        ].head(250),
+        use_container_width=True,
+    )
+
+# ======================================
+# 🧵 MAIN
+# ======================================
+
+def main():
+    init_state()
+    inject_theme()
+    
+    st.title("⚡ Edge Force Dominion – Global Odds Engine")
+
+    # Auto-refresh every 3 seconds when app is running
+    if st.session_state["boot_done"]:
+        st_autorefresh(interval=3000, key="oddsrefresher")
+
+    # Sidebar: API key & sportsbooks
+    with st.sidebar:
+        st.markdown("### 🔐 OpticOdds API Key")
+        key_input = st.text_input(
+            "API key",
+            value=st.session_state["api_key"],
+            type="password",
+            help="Enter your OpticOdds API key",
+        )
+        if key_input:
+            st.session_state["api_key"] = key_input
+
+        st.markdown("### 📚 Sportsbooks")
+        current_books = st.session_state["sportsbooks"]
+        books_text = st.text_input(
+            "Comma separated sportsbooks",
+            value=",".join(current_books),
+        )
+        st.session_state["sportsbooks"] = [
+            b.strip() for b in books_text.split(",") if b.strip()
+        ]
+
+        st.markdown("---")
+        st.markdown(
+            "**How it works:**\n"
+            "1. App boots and loads all static data\n"
+            "2. SSE streaming auto-starts for default sport\n"
+            "3. Updates every 3 seconds automatically\n"
+            "4. Use Pause/Resume to control streaming"
+        )
+
+    # Boot sequence
+    if not st.session_state["boot_done"]:
+        st.subheader("🧩 Booting Edge Force Dominion Board")
+        with st.spinner("Pulling fixtures + odds for all sports..."):
+            boot_backend()
+
+        st.markdown("#### Boot log")
+        for line in st.session_state["boot_log"]:
+            st.markdown(f"- {line}")
+        st.stop()
+
+    # Post-boot: Auto-start SSE streaming
+    if st.session_state["boot_done"] and not st.session_state["sse_running"]:
+        start_sse_streaming(st.session_state["current_sport_filter"])
+        st.rerun()
+
+    # Quick view of boot log
+    with st.expander("View boot log", expanded=False):
+        for line in st.session_state["boot_log"]:
+            st.markdown(f"- {line}")
+
+    # Board
+    render_board()
+    st.markdown("---")
+    render_console()
+
+if __name__ == "__main__":
+    main()
