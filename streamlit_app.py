@@ -32,6 +32,27 @@ CORE_MARKETS = ["moneyline", "spread", "total_points"]
 DEFAULT_SPORTSBOOKS = ["DraftKings", "FanDuel", "Caesars", "BetMGM"]
 MAX_FIXTURES_PER_ODDS_CALL = 5
 
+# Rate limiting delays (seconds)
+SPORT_DELAY = 1.0      # Between sports
+CHUNK_DELAY = 0.5      # Between odds chunks
+
+# ======================================
+# 🔐 API KEY MANAGEMENT
+# ======================================
+
+def get_api_key():
+    """Get API key from secrets.toml first, then environment, then session state."""
+    try:
+        return st.secrets["opticodds"]["api_key"]
+    except:
+        pass
+    
+    env_key = os.getenv("OPTICODDS_API_KEY", "")
+    if env_key:
+        return env_key
+    
+    return st.session_state.get("api_key", "")
+
 # ======================================
 # 🎨 THEME
 # ======================================
@@ -80,6 +101,12 @@ def inject_theme():
         .cmd-system {
             color: #a5b4fc;
         }
+        .status-box {
+            border-radius: 8px;
+            padding: 8px 12px;
+            margin: 4px 0;
+            font-size: 0.85rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -125,7 +152,7 @@ def init_state():
         "board_df": pd.DataFrame(),
         "messages": [],
         "sportsbooks": DEFAULT_SPORTSBOOKS.copy(),
-        "api_key": os.getenv("OPTICODDS_API_KEY", ""),
+        "api_key": get_api_key(),
         "sse_queue": queue.Queue(),
         "sse_running": False,
         "sse_thread": None,
@@ -145,7 +172,12 @@ def log_boot(msg: str):
 
 def optic_get(path: str, params: Dict) -> Dict:
     params = dict(params)
-    params["key"] = st.session_state["api_key"]
+    api_key = st.session_state["api_key"]
+    
+    if not api_key:
+        raise ValueError("❌ No API key configured. Please add your OpticOdds API key.")
+    
+    params["key"] = api_key
     url = f"{OPTICODDS_BASE}{path}"
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
@@ -156,15 +188,20 @@ def fetch_active_fixtures(sport_id: str, league_id: str, days_ahead: int = 2) ->
     after = now.isoformat().replace("+00:00", "Z")
     before = (now + timedelta(days=days_ahead)).isoformat().replace("+00:00", "Z")
 
-    resp = optic_get(
-        "/fixtures/active",
-        {
-            "sport": sport_id,
-            "league": league_id,
-            "start_date_after": after,
-            "start_date_before": before,
-        },
-    )
+    try:
+        resp = optic_get(
+            "/fixtures/active",
+            {
+                "sport": sport_id,
+                "league": league_id,
+                "start_date_after": after,
+                "start_date_before": before,
+            },
+        )
+    except ValueError as e:
+        st.error(str(e))
+        return pd.DataFrame()
+        
     data = resp.get("data", [])
     rows = []
 
@@ -191,56 +228,75 @@ def fetch_active_fixtures(sport_id: str, league_id: str, days_ahead: int = 2) ->
 
     return pd.DataFrame(rows)
 
-def fetch_odds_for_fixtures(
+def fetch_odds_for_fixtures_respectful(
     fixture_ids: List[str],
     markets: List[str],
     sportsbooks: List[str],
+    status_text,
 ) -> pd.DataFrame:
+    """
+    Fetch odds with chunking and respectful delays between calls.
+    Processes one chunk at a time to avoid rate limiting.
+    """
     if not fixture_ids:
         return pd.DataFrame()
 
     rows = []
-
+    total_chunks = (len(fixture_ids) + MAX_FIXTURES_PER_ODDS_CALL - 1) // MAX_FIXTURES_PER_ODDS_CALL
+    
     for i in range(0, len(fixture_ids), MAX_FIXTURES_PER_ODDS_CALL):
         chunk = fixture_ids[i : i + MAX_FIXTURES_PER_ODDS_CALL]
-        resp = optic_get(
-            "/fixtures/odds",
-            {
-                "fixture_id": chunk,
-                "sportsbook": sportsbooks,
-                "market": markets,
-                "odds_format": "AMERICAN",
-            },
-        )
-        data = resp.get("data", [])
+        chunk_num = i // MAX_FIXTURES_PER_ODDS_CALL + 1
+        
+        status_text.text(f"📡 Processing odds chunk {chunk_num}/{total_chunks}...")
+        
+        try:
+            resp = optic_get(
+                "/fixtures/odds",
+                {
+                    "fixture_id": chunk,
+                    "sportsbook": sportsbooks,
+                    "market": markets,
+                    "odds_format": "AMERICAN",
+                },
+            )
+            data = resp.get("data", [])
 
-        for fx in data:
-            fid = fx["id"]
-            start_date = fx.get("start_date")
-            home_name = fx.get("home_team_display")
-            away_name = fx.get("away_team_display")
-            sport = fx.get("sport", {}).get("id")
-            league = fx.get("league", {}).get("id")
+            for fx in data:
+                fid = fx["id"]
+                start_date = fx.get("start_date")
+                home_name = fx.get("home_team_display")
+                away_name = fx.get("away_team_display")
+                sport = fx.get("sport", {}).get("id")
+                league = fx.get("league", {}).get("id")
 
-            for od in fx.get("odds", []):
-                rows.append(
-                    {
-                        "fixture_id": fid,
-                        "sport": sport,
-                        "league": league,
-                        "start_date": start_date,
-                        "home_name": home_name,
-                        "away_name": away_name,
-                        "sportsbook": od.get("sportsbook"),
-                        "market_id": od.get("market_id") or od.get("market"),
-                        "market_label": od.get("market"),
-                        "selection": od.get("selection"),
-                        "name": od.get("name"),
-                        "price": od.get("price"),
-                        "grouping_key": od.get("grouping_key"),
-                        "points": od.get("points"),
-                    }
-                )
+                for od in fx.get("odds", []):
+                    rows.append(
+                        {
+                            "fixture_id": fid,
+                            "sport": sport,
+                            "league": league,
+                            "start_date": start_date,
+                            "home_name": home_name,
+                            "away_name": away_name,
+                            "sportsbook": od.get("sportsbook"),
+                            "market_id": od.get("market_id") or od.get("market"),
+                            "market_label": od.get("market"),
+                            "selection": od.get("selection"),
+                            "name": od.get("name"),
+                            "price": od.get("price"),
+                            "grouping_key": od.get("grouping_key"),
+                            "points": od.get("points"),
+                        }
+                    )
+            
+            # Respectful delay between chunks (only if more chunks remain)
+            if i + MAX_FIXTURES_PER_ODDS_CALL < len(fixture_ids):
+                time.sleep(CHUNK_DELAY)
+                
+        except Exception as e:
+            log_boot(f"Chunk {chunk_num} error: {e}")
+            # Continue with next chunk even if one fails
 
     if not rows:
         return pd.DataFrame()
@@ -248,8 +304,6 @@ def fetch_odds_for_fixtures(
     df = pd.DataFrame(rows)
     df["price_decimal"] = df["price"].apply(american_to_decimal)
     df["implied_prob"] = df["price"].apply(implied_prob)
-    df["open_price"] = df["price"]
-    df["open_implied"] = df["implied_prob"]
     return df
 
 # ======================================
@@ -359,45 +413,67 @@ def recompute_ev_and_efd(board_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ======================================
-# 🚀 BOOT SEQUENCE
+# 🚀 BOOT SEQUENCE (ONE CALL AT A TIME)
 # ======================================
 
 def boot_backend():
+    """
+    Runs once on startup:
+    - loops SPORTS_CONFIG one sport at a time
+    - fetches fixtures/active with delay between sports
+    - fetches odds in chunks with delays between chunks
+    - builds unified board
+    - computes EV + EFD
+    """
     board_pieces = []
     books = st.session_state["sportsbooks"]
 
     total_sports = len(SPORTS_CONFIG)
     progress = st.progress(0.0)
+    status_text = st.empty()  # Status indicator
     step = 0
 
     for alias, info in SPORTS_CONFIG.items():
         step += 1
         progress.progress(step / total_sports)
-        log_boot(f"[{alias.upper()}] Fetching fixtures/active...")
-
+        status_text.text(f"📡 Processing {alias.upper()}... (Sport {step}/{total_sports})")
+        
+        # === FETCH FIXTURES (One call) ===
         try:
             fixtures_df = fetch_active_fixtures(info["sport"], info["league"], days_ahead=2)
+            log_boot(f"[{alias.upper()}] ✓ Fixtures: {len(fixtures_df)} games")
         except Exception as e:
-            log_boot(f"[{alias.upper()}] Fixtures error: {e}")
+            log_boot(f"[{alias.upper()}] ✗ Fixtures error: {e}")
+            time.sleep(SPORT_DELAY)
             continue
 
         if fixtures_df.empty:
             log_boot(f"[{alias.upper()}] No active fixtures with odds.")
+            time.sleep(SPORT_DELAY)
             continue
 
         fixture_ids = fixtures_df["fixture_id"].tolist()
-        log_boot(f"[{alias.upper()}] Found {len(fixtures_df)} active fixtures.")
 
+        # === FETCH ODDS (One chunk at a time) ===
         try:
-            odds_df = fetch_odds_for_fixtures(fixture_ids, CORE_MARKETS, books)
+            odds_df = fetch_odds_for_fixtures_respectful(
+                fixture_ids, 
+                CORE_MARKETS, 
+                books, 
+                status_text
+            )
+            log_boot(f"[{alias.upper()}] ✓ Odds: {len(odds_df)} lines")
         except Exception as e:
-            log_boot(f"[{alias.upper()}] Odds error: {e}")
+            log_boot(f"[{alias.upper()}] ✗ Odds error: {e}")
+            time.sleep(SPORT_DELAY)
             continue
 
         if odds_df.empty:
             log_boot(f"[{alias.upper()}] No odds returned for ML/Spread/Total.")
+            time.sleep(SPORT_DELAY)
             continue
 
+        # === MERGE AND STORE ===
         merged = odds_df.merge(
             fixtures_df[
                 ["fixture_id", "home_logo", "away_logo", "status"]
@@ -407,7 +483,15 @@ def boot_backend():
         )
         merged["alias"] = alias
         board_pieces.append(merged)
-        log_boot(f"[{alias.upper()}] Added {len(merged)} board rows.")
+        log_boot(f"[{alias.upper()}] → Added {len(merged)} rows to board")
+        
+        # Respectful delay before next sport
+        if step < total_sports:
+            status_text.text(f"⏳ Pausing {SPORT_DELAY}s before next sport...")
+            time.sleep(SPORT_DELAY)
+
+    status_text.empty()  # Clear status
+    progress.empty()
 
     if not board_pieces:
         st.session_state["board_df"] = pd.DataFrame()
@@ -416,11 +500,11 @@ def boot_backend():
         return
 
     board = pd.concat(board_pieces, ignore_index=True)
-    log_boot("Computing fair probabilities, EV, and EFD scores...")
+    log_boot(f"Computing EV/EFD for {len(board)} total lines...")
     board = recompute_ev_and_efd(board)
     st.session_state["board_df"] = board
     st.session_state["boot_done"] = True
-    log_boot("Boot sequence complete. Board ready.")
+    log_boot("✅ Boot sequence complete. Board ready!")
 
 # ======================================
 # 🛰️ PERSISTENT SSE STREAMING
@@ -826,6 +910,27 @@ def main():
     # Auto-refresh every 3 seconds when app is running
     if st.session_state["boot_done"]:
         st_autorefresh(interval=3000, key="oddsrefresher")
+
+    # Check for API key and show setup instructions if missing
+    if not st.session_state["api_key"]:
+        st.warning("⚠️ No API key found!")
+        with st.expander("🔑 How to add your OpticOdds API key", expanded=True):
+            st.markdown("""
+            ### For Local Development:
+            1. Create a `.env` file in your project root:
+            ```
+            OPTICODDS_API_KEY=your_key_here
+            ```
+            2. Or enter it directly in the sidebar
+
+            ### For Streamlit Cloud:
+            1. Go to your app dashboard
+            2. Click "Settings"
+            3. Add secret: `opticodds.api_key` = your_key_here
+            4. Click "Save"
+            5. Redeploy your app
+            """)
+        return  # Don't proceed without API key
 
     # Sidebar: API key & sportsbooks
     with st.sidebar:
