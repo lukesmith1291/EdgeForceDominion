@@ -101,12 +101,6 @@ def inject_theme():
         .cmd-system {
             color: #a5b4fc;
         }
-        .status-box {
-            border-radius: 8px;
-            padding: 8px 12px;
-            margin: 4px 0;
-            font-size: 0.85rem;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -237,6 +231,7 @@ def fetch_odds_for_fixtures_respectful(
     """
     Fetch odds with chunking and respectful delays between calls.
     Processes one chunk at a time to avoid rate limiting.
+    Snapshots opening odds for steam calculation.
     """
     if not fixture_ids:
         return pd.DataFrame()
@@ -304,6 +299,11 @@ def fetch_odds_for_fixtures_respectful(
     df = pd.DataFrame(rows)
     df["price_decimal"] = df["price"].apply(american_to_decimal)
     df["implied_prob"] = df["price"].apply(implied_prob)
+    
+    # CRITICAL: Snapshot opening odds for steam calculation
+    df["open_price"] = df["price"]
+    df["open_implied"] = df["implied_prob"]
+    
     return df
 
 # ======================================
@@ -411,192 +411,6 @@ def recompute_ev_and_efd(board_df: pd.DataFrame) -> pd.DataFrame:
     df["efd_score"] = df.apply(compute_efd_score_row, axis=1)
 
     return df
-
-# ======================================
-# 🚀 BOOT SEQUENCE (ONE CALL AT A TIME)
-# ======================================
-
-def boot_backend():
-    """
-    Runs once on startup:
-    - loops SPORTS_CONFIG one sport at a time
-    - fetches fixtures/active with delay between sports
-    - fetches odds in chunks with delays between chunks
-    - builds unified board
-    - computes EV + EFD
-    """
-    board_pieces = []
-    books = st.session_state["sportsbooks"]
-
-    total_sports = len(SPORTS_CONFIG)
-    progress = st.progress(0.0)
-    status_text = st.empty()  # Status indicator
-    step = 0
-
-    for alias, info in SPORTS_CONFIG.items():
-        step += 1
-        progress.progress(step / total_sports)
-        status_text.text(f"📡 Processing {alias.upper()}... (Sport {step}/{total_sports})")
-        
-        # === FETCH FIXTURES (One call) ===
-        try:
-            fixtures_df = fetch_active_fixtures(info["sport"], info["league"], days_ahead=2)
-            log_boot(f"[{alias.upper()}] ✓ Fixtures: {len(fixtures_df)} games")
-        except Exception as e:
-            log_boot(f"[{alias.upper()}] ✗ Fixtures error: {e}")
-            time.sleep(SPORT_DELAY)
-            continue
-
-        if fixtures_df.empty:
-            log_boot(f"[{alias.upper()}] No active fixtures with odds.")
-            time.sleep(SPORT_DELAY)
-            continue
-
-        fixture_ids = fixtures_df["fixture_id"].tolist()
-
-        # === FETCH ODDS (One chunk at a time) ===
-        try:
-            odds_df = fetch_odds_for_fixtures_respectful(
-                fixture_ids, 
-                CORE_MARKETS, 
-                books, 
-                status_text
-            )
-            log_boot(f"[{alias.upper()}] ✓ Odds: {len(odds_df)} lines")
-        except Exception as e:
-            log_boot(f"[{alias.upper()}] ✗ Odds error: {e}")
-            time.sleep(SPORT_DELAY)
-            continue
-
-        if odds_df.empty:
-            log_boot(f"[{alias.upper()}] No odds returned for ML/Spread/Total.")
-            time.sleep(SPORT_DELAY)
-            continue
-
-        # === MERGE AND STORE ===
-        merged = odds_df.merge(
-            fixtures_df[
-                ["fixture_id", "home_logo", "away_logo", "status"]
-            ],
-            on="fixture_id",
-            how="left",
-        )
-        merged["alias"] = alias
-        board_pieces.append(merged)
-        log_boot(f"[{alias.upper()}] → Added {len(merged)} rows to board")
-        
-        # Respectful delay before next sport
-        if step < total_sports:
-            status_text.text(f"⏳ Pausing {SPORT_DELAY}s before next sport...")
-            time.sleep(SPORT_DELAY)
-
-    status_text.empty()  # Clear status
-    progress.empty()
-
-    if not board_pieces:
-        st.session_state["board_df"] = pd.DataFrame()
-        st.session_state["boot_done"] = True
-        log_boot("Boot finished, but no data was returned.")
-        return
-
-    board = pd.concat(board_pieces, ignore_index=True)
-    log_boot(f"Computing EV/EFD for {len(board)} total lines...")
-    board = recompute_ev_and_efd(board)
-    st.session_state["board_df"] = board
-    st.session_state["boot_done"] = True
-    log_boot("✅ Boot sequence complete. Board ready!")
-
-# ======================================
-# 🛰️ PERSISTENT SSE STREAMING
-# ======================================
-
-def sse_listener(sport_id: str, league_id: str, sportsbooks: List[str], markets: List[str]):
-    """Background thread: continuously listens to SSE and puts events into queue."""
-    while st.session_state["sse_running"]:
-        try:
-            params = {
-                "league": league_id,
-                "sportsbook": ",".join(sportsbooks),
-                "market": ",".join(markets),
-                "odds_format": "AMERICAN",
-                "key": st.session_state["api_key"],
-            }
-            url = f"{OPTICODDS_BASE}/stream/odds/{sport_id}"
-            
-            with requests.get(
-                url, 
-                params=params, 
-                headers={"Accept": "text/event-stream"}, 
-                stream=True, 
-                timeout=30
-            ) as resp:
-                resp.raise_for_status()
-                client = sseclient.SSEClient(resp)
-                
-                for event in client.events():
-                    if not st.session_state["sse_running"]:
-                        return
-                    
-                    if event.data:
-                        try:
-                            data = json.loads(event.data)
-                            st.session_state["sse_queue"].put(data)
-                        except json.JSONDecodeError:
-                            continue
-                            
-        except Exception as e:
-            st.session_state["sse_queue"].put({"type": "error", "message": str(e)})
-            time.sleep(5)
-
-def start_sse_streaming(sport_alias: str):
-    """Start SSE listener for a specific sport."""
-    if st.session_state["sse_running"]:
-        return
-    
-    info = SPORTS_CONFIG.get(sport_alias)
-    if not info:
-        return
-    
-    st.session_state["sse_running"] = True
-    st.session_state["current_sport_filter"] = sport_alias
-    
-    thread = threading.Thread(
-        target=sse_listener,
-        args=(info["sport"], info["league"], st.session_state["sportsbooks"], CORE_MARKETS),
-        daemon=True,
-    )
-    thread.start()
-    st.session_state["sse_thread"] = thread
-
-def stop_sse_streaming():
-    """Stop SSE listener."""
-    st.session_state["sse_running"] = False
-    st.session_state["sse_thread"] = None
-
-def process_pending_updates() -> bool:
-    """Process any SSE updates in the queue. Returns True if updates were applied."""
-    if st.session_state["board_df"].empty:
-        return False
-    
-    updates = []
-    while True:
-        try:
-            item = st.session_state["sse_queue"].get_nowait()
-            if isinstance(item, dict) and item.get("type") == "error":
-                st.warning(f"SSE error: {item.get('message')}", icon="⚠️")
-            else:
-                updates.append(item)
-        except queue.Empty:
-            break
-    
-    if updates:
-        df = st.session_state["board_df"]
-        df = apply_stream_events(df, updates)
-        st.session_state["board_df"] = df
-        st.session_state["last_update"] = datetime.now(timezone.utc)
-        return True
-    
-    return False
 
 # ======================================
 # 🧠 COMMAND CONSOLE
