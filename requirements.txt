@@ -1,14 +1,5 @@
-# Core
-streamlit==1.40.1
-streamlit-autorefresh==0.0.1
-
-# data / math
-pandas==2.2.3
-numpy==1.26.4
-
-# HTTP / SSE
-requests==2.32.3
-sseclient-py==1.8.0      # drop-in replacement for sseclient, works over SSL
-
-# utils
-python-dotenv==1.0.1     # only needed for local .env files
+streamlit
+streamlit-autorefresh
+pandas
+numpy
+requests
